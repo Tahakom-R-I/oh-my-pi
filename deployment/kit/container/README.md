@@ -23,6 +23,7 @@ recommended path for pure terminal use; choose this variant when you need
 | `omp-remote` | Terminal client (python3 + curl): persistent sessions, full agent view (thinking, tools, todos), auto-resume |
 | `git-bridge` | Commit-based code sync with machines outside the host (`seed/push/pull/log/reset`) |
 | `ui/` | Web console backend + frontend (vanilla JS, no build step) |
+| `ui/.ui-token` | Web console login token (auto-generated — distinct from the container API token in `run/token`) |
 | `ARCHITECTURE.md` | Full design document: request lifetime, multi-tenancy, hardening, scaling paths |
 
 Runtime state lives in `run/` next to this folder (created on first deploy):
@@ -74,6 +75,8 @@ host-directory snapshot), session start/steer/abort, live prompt streaming
 (thinking, tool calls with output, todo lists, retries), workspace
 export back to a host directory. The container token stays server-side.
 
+Note: the console login token is `ui/.ui-token` (printed at UI startup) — distinct from the container API token (`run/token`).
+
 **Terminal** — `./omp-remote "prompt"` from the host (or anywhere that can
 reach the API; override `OMP_REMOTE_URL`/`OMP_REMOTE_TOKEN`):
 
@@ -114,6 +117,15 @@ thinking, tool-call, and text-delta events, `event: done` terminator).
 Health: `curl -s -H "Authorization: Bearer $(cat run/token)" \
 http://localhost:8080/healthz` (reports live + busy session counts). The
 image also carries a Docker `HEALTHCHECK`.
+
+Common issues:
+
+| Symptom | Fix |
+|---|---|
+| `deploy.sh`: port 8080 already in use | another service holds it — stop it, or `PORT=<free port> ./deploy.sh`. A foreign holder aborts the deploy; the script replaces only its own previous deployment |
+| Web console login rejects the API token | the console uses its own token: `ui/.ui-token` (printed at UI startup) — not `run/token` |
+| 401/`not_found` in the console after a redeploy | the browser tab held a session that died with the old container — reload the page and send the prompt again; it auto-resumes from the transcript or starts fresh |
+| UI shows "container unreachable" after `--clean` | expected: the deployment was wiped — `./deploy.sh` to bring it back |
 
 ## 8. Security notes
 

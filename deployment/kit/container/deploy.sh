@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# Container deployment: omp behind an HTTP API in Docker (server variant of the simulation kit) (report §3.1/§6.4).
+# deploy.sh — deploy omp behind an HTTP API in Docker (container variant).
 #
 # Mapping:
-#   container            = the Compute Engine VM
-#   published port       = global LB + IAP   (bearer token stands in for OIDC)
-#   /root/.omp volume    = persistent disk  (host ~/.omp import = Secret Manager)
-#   /workspaces volume   = tenant workspace storage
+#   container            = the application server
+#   published port       = LB / direct exposure (bearer token = the access gate)
+#   state volume         = persistent disk  (host ~/.omp import = Secret Manager)
+#   workspaces volume    = tenant workspace storage
+#   git-bridge volume    = commit-based code sync with machines outside the host
 #   smoke test           = deployment verification
 #
 # Usage:
@@ -16,15 +17,18 @@
 # Env:
 #   PORT=8080                  host port to publish
 #   OMP_API_TOKEN=<hex>        reuse a token instead of generating one
-#   IMPORT_HOST_OMP_CONFIG=0   skip copying host ~/.omp credentials (Secret Manager analog)
+#   IMPORT_HOST_OMP_CONFIG=1   copy host ~/.omp credentials into container state
+#                              (admin workstation only — the host vault must be trusted)
 #   OMP_APPROVAL=restricted    run sessions with tools.approvalMode=write instead of yolo
+#   OMP_SESSION_IDLE_MINUTES=30  idle session eviction (safe: transcripts are durable)
+#   OMP_OTEL=1                 enable OpenTelemetry spans on the agent loop
 set -euo pipefail
 
 IMAGE=omp-server:kit
 NAME=omp-server
 PORT=${PORT:-8080}
-SIM_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-RUN_DIR="$SIM_DIR/run"
+KIT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+RUN_DIR="$KIT_DIR/run"
 BASE="http://localhost:$PORT"
 
 die() { echo "ERROR: $*" >&2; exit 1; }
@@ -47,8 +51,8 @@ case ${1:-} in
 	;;
 --clean)
 	cleanup
-	docker run --rm -v "$RUN_DIR":/mnt "$IMAGE" sh -c 'rm -rf /mnt/state /mnt/workspaces' 2>/dev/null || true
 	docker rmi -f "$IMAGE" >/dev/null 2>&1 || true
+	docker run --rm -u 0 -v "$RUN_DIR":/mnt "$IMAGE" sh -c 'rm -rf /mnt/state /mnt/workspaces /mnt/git-bridge' 2>/dev/null || true
 	rm -rf "$RUN_DIR"
 	echo "cleaned container, image, and state"
 	exit 0
@@ -60,11 +64,11 @@ case ${1:-} in
 esac
 
 command -v jq >/dev/null || die "jq required"
-command -v sqlite3 >/dev/null || die "sqlite3 required"
+command -v openssl >/dev/null || die "openssl required"
 
 # --- state + credential import (cloud analog: Secret Manager / auth-broker) --
 mkdir -p "$RUN_DIR/state/.omp/agent" "$RUN_DIR/workspaces" "$RUN_DIR/git-bridge"
-if [[ ${IMPORT_HOST_OMP_CONFIG:-1} == 1 && -f "$HOME/.omp/agent/agent.db" ]]; then
+if [[ ${IMPORT_HOST_OMP_CONFIG:-0} == 1 && -f "$HOME/.omp/agent/agent.db" ]]; then
 	echo ">> importing host omp credentials into container state (Secret Manager analog)"
 	sqlite3 "$HOME/.omp/agent/agent.db" ".backup '$RUN_DIR/state/.omp/agent/agent.db'"
 	for f in config.yml models.yml models.db; do
@@ -73,21 +77,33 @@ if [[ ${IMPORT_HOST_OMP_CONFIG:-1} == 1 && -f "$HOME/.omp/agent/agent.db" ]]; th
 		fi
 	done
 else
-	echo ">> no host omp config imported; pass provider keys via env or configure the session manually"
+	echo ">> no host omp config imported; configure credentials via environment or models.yml"
 fi
 
-# --- build + run --------------------------------------------------------------
+# --- build ---------------------------------------------------------------------
 echo ">> building $IMAGE"
-docker build -f "$SIM_DIR/Dockerfile" -t "$IMAGE" "$SIM_DIR"
+docker build -f "$KIT_DIR/Dockerfile" -t "$IMAGE" "$KIT_DIR"
 
 # Run as the host user so agent-created files are user-owned (no root-owned
 # leftovers in bind mounts). One-time chown of existing volume contents.
-docker run --rm -u 0 -v "$RUN_DIR/state:/state" -v "$RUN_DIR/workspaces:/workspaces" "$IMAGE" \
-	chown -R "$(id -u):$(id -g)" /state /workspaces >/dev/null 2>&1 || true
+docker run --rm -u 0 -v "$RUN_DIR":/mnt "$IMAGE" \
+	chown -R "$(id -u):$(id -g)" /mnt/state /mnt/workspaces >/dev/null 2>&1 || true
 
 TOKEN=${OMP_API_TOKEN:-$(openssl rand -hex 24)}
 echo "$TOKEN" > "$RUN_DIR/token"
+
+# --- port pre-flight: fail early and clearly on a foreign port holder ---------
+# (our own previous container holding the port is fine — cleanup replaces it)
+if (exec 3<>"/dev/tcp/127.0.0.1/$PORT") 2>/dev/null; then
+	if docker ps --filter "name=$NAME" --format '{{.Ports}}' | grep -q ":$PORT->"; then
+		echo ">> port $PORT is held by the previous $NAME deployment (replacing it)"
+	else
+		die "port $PORT is already in use by another service — stop it first, or deploy with PORT=<free port>"
+	fi
+fi
 cleanup
+
+# --- environment ---------------------------------------------------------------
 ENV_ARGS=()
 for k in OPENAI_API_KEY ANTHROPIC_API_KEY ANTHROPIC_OAUTH_TOKEN GEMINI_API_KEY MISTRAL_API_KEY \
 	GROQ_API_KEY XAI_API_KEY OPENROUTER_API_KEY AZURE_OPENAI_API_KEY ZAI_API_KEY LITELLM_API_KEY; do
@@ -152,9 +168,10 @@ else
 fi
 
 echo
-echo "VM(sim):   $NAME"
+echo "deployment: $NAME"
 echo "API:       $BASE   (healthz, /v1/sessions, /v1/sessions/:id/prompt)"
 echo "Token:     $TOKEN   (saved in $RUN_DIR/token)"
+echo "Web UI:    node ui/server.mjs   (http://localhost:8090 — login token in ui/.ui-token)"
 echo "Try:       curl -sS -H \"Authorization: Bearer \$(cat $RUN_DIR/token)\" $BASE/healthz"
 echo "Logs:      docker logs -f $NAME"
-echo "Teardown:  container/deploy.sh --down   (or --clean to wipe everything)"
+echo "Teardown:  deploy.sh --down   (or --clean to wipe everything)"

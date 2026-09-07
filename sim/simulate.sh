@@ -4,7 +4,7 @@
 # Mapping:
 #   container            = the Compute Engine VM
 #   published port       = global LB + IAP   (bearer token stands in for OIDC)
-#   /root/.omp volume    = persistent disk  (host ~/.omp import = Secret Manager)
+#   /state volume (HOME)  = persistent disk  (host ~/.omp import = Secret Manager)
 #   /workspaces volume   = tenant workspace storage
 #   smoke test           = deployment verification
 #
@@ -88,6 +88,15 @@ docker run --rm -u 0 -v "$RUN_DIR/state:/state" -v "$RUN_DIR/workspaces:/workspa
 TOKEN=${OMP_API_TOKEN:-$(openssl rand -hex 24)}
 echo "$TOKEN" > "$RUN_DIR/token"
 cleanup
+# --- port pre-flight: fail early and clearly on a foreign port holder ---------
+# (our own previous container holding the port is fine — cleanup replaces it)
+if (exec 3<>"/dev/tcp/127.0.0.1/$PORT") 2>/dev/null; then
+	if docker ps --filter "name=$NAME" --format '{{.Ports}}' | grep -q ":$PORT->"; then
+		echo ">> port $PORT is held by the previous $NAME deployment (replacing it)"
+	else
+		die "port $PORT is already in use by another service — stop it first, or deploy with PORT=<free port>"
+	fi
+fi
 ENV_ARGS=()
 for k in OPENAI_API_KEY ANTHROPIC_API_KEY ANTHROPIC_OAUTH_TOKEN GEMINI_API_KEY MISTRAL_API_KEY \
 	GROQ_API_KEY XAI_API_KEY OPENROUTER_API_KEY AZURE_OPENAI_API_KEY ZAI_API_KEY LITELLM_API_KEY; do
