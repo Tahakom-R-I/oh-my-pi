@@ -478,7 +478,67 @@ curl -s http://127.0.0.1:8765/v1/healthz            # broker, if deployed [verif
 
 ---
 
+## 8. Container deployment with the web console [verified]
+
+For API/web access instead of (or alongside) per-user terminal use, the
+deployment kit ships a **container variant** (`deployment/kit/container/` in
+the repository; `container/` inside the kit tarball): omp runs inside a
+Docker container behind an authenticated HTTP/SSE API, with a browser
+console and a remote terminal client on top. The full design — request
+lifetime, state model, multi-tenancy options, scaling paths, hardening
+checklist — is in `container/ARCHITECTURE.md` inside the kit.
+
+### What you get
+
+| Component | Purpose |
+|---|---|
+| HTTP/SSE API | create sessions, stream prompts (thinking, tool calls, text deltas), steer/abort — bearer-token authenticated |
+| Web console (`ui/`, Node ≥ 20 host process + browser) | workspace seeding (git URL clone or host-directory snapshot), session management, live agent view; container token stays server-side |
+| Terminal client (`omp-remote`, python3 + curl) | persistent sessions with auto-resume, full agent view in the terminal |
+| Git bridge (`git-bridge`) | commit-based code sync with machines outside the host (bare repo both sides push/pull) |
+
+### Deploy
+
+```sh
+cd container/
+./deploy.sh                     # build image, run container, smoke test
+node ui/server.mjs              # web console on http://127.0.0.1:8090
+./omp-remote "prompt"           # or drive it from the terminal
+```
+
+Credentials: the deploy script snapshots the host's omp credential vault
+(`agent.db`) and model config into the container state volume, so the
+container uses the same providers as the host user. Alternative: provider
+keys via environment (`OPENAI_API_KEY`, …) or a central auth-broker (§3).
+
+### Session durability [verified]
+
+Transcripts are JSONL files on a persistent volume; the in-process session
+is only a cache. Verified flow: teach a session a codeword → `docker restart`
+the container (in-memory state wiped, old session id → 404) → the client
+automatically re-creates the session from the stored transcript
+(`SessionManager.open`) → the full conversation context is restored.
+Idle sessions are evicted from memory on the same principle
+(`OMP_SESSION_IDLE_MINUTES`, default 30) — eviction never loses history.
+
+### Hardening applied [verified]
+
+- Disconnect-safe SSE streams (client abort does not crash the wrapper);
+  `unhandledRejection`/`uncaughtException` are logged, the latter exits for
+  supervisor replacement.
+- Timing-safe bearer-token comparison; prompt size cap (413).
+- Container runs as the host UID (`--user`, `HOME` on the state volume):
+  agent-created files are user-owned on the host; a per-deploy `chown`
+  migrates legacy volumes.
+- Idle eviction, structured request logging (method/path/status/duration),
+  Docker `HEALTHCHECK` on `/healthz`.
+- Tool approval defaults remain configurable per deployment
+  (`OMP_APPROVAL=restricted` → `tools.approvalMode: write`).
+
+---
+
 ## TL;DR
+
 
 ```sh
 # Install system-wide (all users), reviewed-download variant:

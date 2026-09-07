@@ -21,6 +21,7 @@ machine.** This runbook is self-contained.
 | `THIRD-PARTY-NOTICES.txt` | License attribution for shipped components |
 | `systemd/omp-auth-broker.service` | Optional credential-vault service unit |
 | `config/*.example` | Config templates (provider keys, custom models, MCP, secrets) |
+| `container/` | **Container-based deployment variant**: omp behind an authenticated HTTP API in Docker — web console, terminal client, git bridge. See `container/README.md` and §13 |
 | `README.md` | This runbook |
 
 Integrity: `install.sh` refuses to install unless `bin/omp` matches the
@@ -169,3 +170,25 @@ Broker: `curl -s http://127.0.0.1:8765/v1/healthz`
   like SSH sessions. Keep interactive approval defaults ("always-ask");
   automation should opt into `--approval-mode` explicitly.
 - Never put API keys in `/etc/environment`, project repos, or the kit.
+
+---
+
+## 13. Container-based deployment (Docker + web console)
+
+For API/web-console access instead of (or alongside) per-user terminal use,
+the kit ships a **container variant** under `container/`: omp runs inside a
+Docker container behind an authenticated HTTP/SSE API, with a browser console
+and a remote terminal client on top.
+
+```sh
+cd container/
+./deploy.sh                # build + run + credential import + smoke test
+node ui/server.mjs         # web console on http://127.0.0.1:8090 (token printed)
+./omp-remote "prompt"      # or drive it from the terminal
+```
+
+Details, credentials, operations, and the security model: **`container/README.md`**.
+The full design (request lifetime, multi-tenancy, scaling paths) is in
+`container/ARCHITECTURE.md`. Requirements beyond the standard kit: Docker
+Engine on the target host; the container has network access to your LLM
+provider.

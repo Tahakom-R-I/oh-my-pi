@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+# git-bridge — share code between your machine and the omp container through a
+# bare git repo (sim/run/git-bridge/project.git). Cloud analog: the GitHub
+# remote both your laptop and the deployment pull/push to.
+#
+# Usage:
+#   sim/git-bridge seed <dir>        first-time: publish <dir> as bridge main
+#   sim/git-bridge push <dir> [msg]  commit local edits and push to the bridge
+#   sim/git-bridge pull <dir>        bring container-side edits into <dir>
+#   sim/git-bridge log               recent commits on the bridge
+#   sim/git-bridge reset             close the bridge: clear history + container clone
+#
+# Re-seeding over an existing bridge replaces its history: FORCE=1 sim/git-bridge seed <dir>
+set -euo pipefail
+
+SIM_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+BRIDGE="$SIM_DIR/run/git-bridge/project.git"
+RUN_DIR="$SIM_DIR/run"
+
+die() { echo "git-bridge: $*" >&2; exit 1; }
+
+command -v git >/dev/null || die "git required"
+
+case ${1:-} in
+seed)
+	DIR=${2:?usage: git-bridge seed <dir>}
+	[[ -d $DIR ]] || die "not a directory: $DIR"
+	DIR=$(realpath "$DIR")
+	if [[ $BRIDGE == "$DIR" || $BRIDGE == "$DIR"/* ]]; then
+		die "refusing: $DIR contains the bridge itself (sim/run/...) — point seed at your project directory"
+	fi
+	[[ -d $BRIDGE ]] || git init --bare -q "$BRIDGE"
+	if git --git-dir="$BRIDGE" rev-parse -q --verify refs/heads/main >/dev/null 2>&1 && [[ ${FORCE:-0} != 1 ]]; then
+		die "bridge already has history (sim/git-bridge log). Options:
+  FORCE=1 sim/git-bridge seed \"$DIR\"   # replace bridge main with this directory's content
+  sim/git-bridge pull \"$DIR\"            # keep bridge history, bring it into this directory
+  sim/git-bridge push \"$DIR\"            # share this directory's edits to the bridge"
+	fi
+	cd "$DIR"
+	git init -b main -q 2>/dev/null || git init -q
+	git remote remove bridge 2>/dev/null || true
+	git remote add bridge "$BRIDGE"
+	git add -A
+	local_branch=$(git rev-parse --abbrev-ref HEAD)
+	if [[ ${FORCE:-0} == 1 ]]; then
+		git push -qfu bridge "HEAD:refs/heads/main"
+	else
+		git push -qu bridge "HEAD:refs/heads/main"
+	fi
+	echo "seeded bridge main with $(git rev-parse --short HEAD) from $DIR (local branch: $local_branch)"
+	;;
+push)
+	DIR=${2:?usage: git-bridge push <dir> [message]}
+	MSG=${3:-host: manual sync}
+	cd "$DIR"
+	git remote remove bridge 2>/dev/null || true
+	git remote add bridge "$BRIDGE"
+	git add -A
+	git commit -qm "$MSG" 2>/dev/null || echo "(no local changes to commit)"
+	git push bridge main
+	echo "pushed $(git rev-parse --short HEAD) to bridge"
+	;;
+pull)
+	DIR=${2:?usage: git-bridge pull <dir>}
+	cd "$DIR"
+	git remote remove bridge 2>/dev/null || true
+	git remote add bridge "$BRIDGE"
+	git pull bridge main
+	echo "pulled bridge into $DIR"
+	;;
+reset)
+	# Close the current bridge: clear its history and the container's clone.
+	# (The bridge is a folder, not a process — nothing is "running".)
+	if ! docker info >/dev/null 2>&1; then
+		if getent group docker | grep -qw "$(id -un)" && command -v sg >/dev/null 2>&1; then
+			exec sg docker -c "$(printf '%q ' "$0" "$@")"
+		fi
+		die "docker not accessible — needed to clear root-owned bridge files"
+	fi
+	[[ -d $RUN_DIR/git-bridge || -d $RUN_DIR/workspaces/git ]] || { echo "nothing to reset"; exit 0; }
+	# Clear contents only — deleting the mount-root directory itself would
+	# detach the running container's /git-bridge bind mount (stale inode).
+	docker run --rm -v "$RUN_DIR":/mnt omp-vm:sim sh -c 'rm -rf /mnt/git-bridge/project.git /mnt/workspaces/git' >/dev/null 2>&1 ||
+		die "cleanup container failed (is the omp-vm:sim image built? run: bash sim/simulate.sh)"
+	echo "bridge closed (history + container clone cleared)."
+	echo "start a new one:  sim/git-bridge seed <project-dir>"
+	echo "also run:         sim/omp-remote --new   (drop the client's session pointer)"
+	;;
+log)
+	git --git-dir="$BRIDGE" log --oneline --decorate -15 main 2>/dev/null || echo "(bridge is empty)"
+	;;
+*)
+	echo "usage: git-bridge seed <dir> | push <dir> [msg] | pull <dir> | log | reset" >&2
+	exit 1
+	;;
+esac
