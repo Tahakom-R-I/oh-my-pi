@@ -169,19 +169,21 @@ AUTH=(-H "Authorization: Bearer $TOKEN")
 
 smoke_once() {
 	local SID
-	SID=$(curl -fsS -m 30 "${AUTH[@]}" -H "content-type: application/json" -d '{}' "$BASE/v1/sessions" | jq -r .sessionId) || return 1
+	SID=$(curl -fsS -m 30 "${AUTH[@]}" -H "content-type: application/json" \
+		-d '{"cwd":"/workspaces/smoke"}' "$BASE/v1/sessions" | jq -r .sessionId) || return 1
 	echo "   sessionId: $SID"
-	curl -sS -N -m 120 "${AUTH[@]}" -H "content-type: application/json" \
+	curl -fsS -m 120 "${AUTH[@]}" -H "content-type: application/json" \
 		-d '{"text":"Reply with exactly: PONG"}' \
 		"$BASE/v1/sessions/$SID/prompt" >"$RUN_DIR/smoke.sse" || return 1
 	tr -d '\n' <"$RUN_DIR/smoke.sse" | grep -q "PONG"
 }
-
 echo ">> smoke test (create session + prompt)"
 if smoke_once; then
 	echo ">> SMOKE OK — model responded through the HTTP API"
+	rm -rf "$RUN_DIR/workspaces/smoke" # smoke cwd — don't clutter the workspaces panel
 elif smoke_once; then
 	echo ">> SMOKE OK on retry — first attempt hit a provider/model flake"
+	rm -rf "$RUN_DIR/workspaces/smoke"
 else
 	echo ">> SMOKE DEGRADED — API reachable but no model response (see $RUN_DIR/smoke.sse)" >&2
 	tail -c 2000 "$RUN_DIR/smoke.sse" >&2 || true
