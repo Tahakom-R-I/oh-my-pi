@@ -75,11 +75,11 @@ user. Cloud analog: Secret Manager injection or the `omp auth-broker` vault
 ## 5. Clients
 
 **Web console** — `ui/start.sh` (host side; Node ≥ 20, zero deps).
-Prints its URL and login token. Features: workspace seeding (git URL clone,
-local-directory **live mount**, or local-directory snapshot), session
-start/steer/abort, live prompt streaming (thinking, tool calls with output,
-todo lists, retries), workspace export back to a host directory. The
-container token stays server-side.
+Prints its URL and login token. Features: workspace seeding (git URL clone or
+local-directory **live mount** — the container works directly in the original
+directory), session start/steer/abort, live prompt streaming (thinking, tool
+calls with output, todo lists, retries), workspace export back to a host
+directory. The container token stays server-side.
 
 Note: the console login token is `ui/.ui-token` (printed at UI startup) —
 distinct from the container API token (`run/token`).
@@ -107,7 +107,6 @@ Three ways to point the agent at host code, in increasing fidelity:
 
 | Mechanism | How | Behavior |
 |---|---|---|
-| **Snapshot** (web console, "snapshot copy") | copies a host directory into `run/workspaces/<name>` | one-time import; result comes back via ⇩ export or git |
 | **Live mount** (web console, "live mount") | records the directory in `run/mounts.json` and recreates the container with it bound at `/workspaces/mnt-<name>` | agent edits land **in the original directory**; mount persists across redeploys |
 | **Projects root** (`PROJECTS_ROOT=<dir>` at deploy) | mounts a whole host tree at `/projects` | every directory under it is dynamically available as `/projects/<name>` — no restarts, new folders appear automatically |
 
@@ -139,6 +138,7 @@ Common issues:
 | 401/`not_found` in the console after a redeploy | the browser tab held a session that died with the old container — reload the page and send the prompt again; it auto-resumes from the transcript or starts fresh |
 | UI shows "container unreachable" after `--clean` | expected: the deployment was wiped — `./deploy.sh` to bring it back |
 | Live mount fails with "a turn is running" | abort the running turn first — mounting recreates the container |
+| Console shows "no workspaces yet" / login misbehaves after redeploying or recreating containers | a stale console process from another deployment folder holds the port — stop all of them (`pkill -f "ui/server.mjs"`), then `ui/start.sh` again |
 
 ## 8. Security notes
 

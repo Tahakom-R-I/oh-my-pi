@@ -195,6 +195,12 @@ async function handleListWorkspaces(res) {
     } catch {}
     out.push({ name: e.name, git: isRepo, remote, mtime });
   }
+  // live mounts (run/mounts.json) are working directories too — surface them
+  let mounts = [];
+  try {
+    mounts = JSON.parse(await fsp.readFile(MOUNTS_FILE, "utf8"));
+  } catch {}
+  for (const m of mounts) out.push({ name: m.container.replace("/workspaces/", ""), mount: true, host: m.host });
   send(res, 200, { workspaces: out });
 }
 /**
@@ -288,30 +294,9 @@ async function handleSeed(res, body) {
     return send(res, 201, { ok: true, workspace: name, source: url.href });
   }
 
-  if (type === "local") {
-    const srcRaw = body.path ?? "";
-    let src;
-    try {
-      src = path.resolve(srcRaw);
-      await fsp.access(src);
-    } catch {
-      return sendErr(res, 400, "bad_path", `not an accessible directory: ${srcRaw}`);
-    }
-    if ((await fsp.stat(src)).isDirectory() !== true)
-      return sendErr(res, 400, "bad_path", `not a directory: ${src}`);
-    const simResolved = path.resolve(SIM_ROOT);
-    if (src === simResolved || src.startsWith(simResolved + path.sep))
-      return sendErr(res, 400, "forbidden_path", "refusing to seed a directory inside sim/ — it contains container state");
-    await fsp.cp(src, dest, {
-      recursive: true,
-      filter: (s) => !/(^|[/\\])node_modules([/\\]|$)/.test(s),
-    });
-    return send(res, 201, {
-      ok: true,
-      workspace: name,
-      note: `snapshot of ${src}; the container edits the live copy in sim/run/workspaces/${name}`,
-    });
-  }
+  if (type === "local")
+    return sendErr(res, 410, "snapshot_disabled", "snapshot seeding is disabled — use live mount instead (POST /api/mount with the host directory path; the agent edits the original directory)");
+
 
   return sendErr(res, 400, "bad_type", "type must be 'git' or 'local'");
 }

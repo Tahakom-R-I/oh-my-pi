@@ -41,10 +41,6 @@
         <form id="seed-form">
           <input id="seed-url" placeholder="https://github.com/user/repo.git">
           <input id="seed-path" placeholder="/home/you/projects/myapp" class="hidden">
-          <div id="local-mode" class="tabs hidden">
-            <label class="tab active"><input type="radio" name="localmode" value="mount" checked> live mount — edit in place</label>
-            <label class="tab"><input type="radio" name="localmode" value="snapshot"> snapshot copy</label>
-          </div>
           <input id="seed-name" placeholder="workspace name" required>
           <button type="submit" class="primary">Seed into container</button>
           <p id="seed-note" class="muted small">Clones the repo into the container's shared workspaces volume.</p>
