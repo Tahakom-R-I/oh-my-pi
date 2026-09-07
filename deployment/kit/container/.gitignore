@@ -1,2 +1,4 @@
 run/
 ui/.ui-token
+ui/.server-pid
+ui/console.log
