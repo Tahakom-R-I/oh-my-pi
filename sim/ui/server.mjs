@@ -73,8 +73,14 @@ function loginThrottled() {
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
+const SEC = {
+  "x-content-type-options": "nosniff",
+  "referrer-policy": "no-referrer",
+  "content-security-policy": "default-src 'self'",
+};
+
 function send(res, status, obj) {
-  res.writeHead(status, { "content-type": "application/json; charset=utf-8" });
+  res.writeHead(status, { ...SEC, "content-type": "application/json; charset=utf-8" });
   res.end(JSON.stringify(obj, null, 2));
 }
 
@@ -397,12 +403,12 @@ function serveStatic(req, res, pathname) {
     if (err) {
       fs.readFile(path.join(PUBLIC_DIR, "index.html"), (err2, index) => {
         if (err2) return sendErr(res, 404, "not_found", "UI files missing");
-        res.writeHead(200, { "content-type": MIME[".html"] });
+        res.writeHead(200, { ...SEC, "content-type": MIME[".html"] });
         res.end(index);
       });
       return;
     }
-    res.writeHead(200, { "content-type": MIME[path.extname(file)] ?? "application/octet-stream", "cache-control": "no-cache" });
+    res.writeHead(200, { ...SEC, "content-type": MIME[path.extname(file)] ?? "application/octet-stream", "cache-control": "no-cache" });
     res.end(data);
   });
 }
@@ -487,3 +493,15 @@ server.listen(PORT, HOST, () => {
   console.log(`UI token:  ${UI_TOKEN}   (also in ${UI_TOKEN_FILE}; override with OMP_UI_TOKEN)`);
   console.log(`container: ${CONTAINER_BASE} (token from ${CONTAINER_TOKEN_FILE})`);
 });
+
+let shuttingDown = false;
+function shutdown() {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log("omp UI: shutting down");
+  server.close(() => process.exit(0));
+  setTimeout(() => process.exit(0), 3000).unref();
+}
+process.on("SIGINT", shutdown);
+process.on("SIGTERM", shutdown);
+process.on("unhandledRejection", (r) => console.error("unhandled rejection:", String(r).slice(0, 500)));

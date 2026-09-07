@@ -93,6 +93,9 @@ for k in OPENAI_API_KEY ANTHROPIC_API_KEY ANTHROPIC_OAUTH_TOKEN GEMINI_API_KEY M
 	GROQ_API_KEY XAI_API_KEY OPENROUTER_API_KEY AZURE_OPENAI_API_KEY ZAI_API_KEY LITELLM_API_KEY; do
 	[[ -n ${!k:-} ]] && ENV_ARGS+=(-e "$k=${!k}")
 done
+for passthrough in OMP_SESSION_IDLE_MINUTES OMP_APPROVAL OMP_OTEL; do
+	[[ -n ${!passthrough:-} ]] && ENV_ARGS+=(-e "$passthrough=${!passthrough}")
+done
 MOUNT_ARGS=()
 if [[ -n ${LOCAL_PROJECT:-} ]]; then
 	HOST_PROJECT=$(realpath "$LOCAL_PROJECT")
