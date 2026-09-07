@@ -74,7 +74,7 @@ user. Cloud analog: Secret Manager injection or the `omp auth-broker` vault
 
 ## 5. Clients
 
-**Web console** — `node ui/server.mjs` (host side; Node ≥ 20, zero deps).
+**Web console** — `ui/start.sh` (host side; Node ≥ 20, zero deps).
 Prints its URL and login token. Features: workspace seeding (git URL clone,
 local-directory **live mount**, or local-directory snapshot), session
 start/steer/abort, live prompt streaming (thinking, tool calls with output,

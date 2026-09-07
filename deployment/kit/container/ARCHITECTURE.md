@@ -457,7 +457,7 @@ browser ──cookie auth──▶ ui backend (host, :8090, Node ≥20, zero dep
 - `sim/ui/server.mjs` — host backend: cookie auth (auto-generated token in `sim/ui/.ui-token`, override with `OMP_UI_TOKEN`; login throttling), static file serving, workspace seeding/proxying, and a streaming SSE relay to the wrapper. Runs on `127.0.0.1:8090` by default.
 - `sim/ui/public/` — single-page frontend (vanilla JS/CSS, no build step): workspace list with per-workspace actions (open session, `git pull`, export to host dir, remove), seed form (Git URL / local directory tabs), session list, composer with Abort/Steer, and a live stream rendering the complete event feed — thinking blocks, tool cards with bounded live output, todo panels, retries, compaction, notices.
 
-**Run:** `node sim/ui/server.mjs` → open the printed URL → paste the printed token. The backend re-reads `run/token` on every request, so `simulate.sh` redeploys need no UI restart.
+**Run:** `sim/ui/start.sh` → open the printed URL → paste the printed token. The backend re-reads `run/token` on every request, so `simulate.sh` redeploys need no UI restart.
 
 **Backend API (all JSON, cookie-authenticated; the proxy endpoints mirror §9 one-for-one):**
 

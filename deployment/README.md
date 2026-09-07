@@ -183,7 +183,7 @@ and a remote terminal client on top.
 ```sh
 cd container/
 ./deploy.sh                # build + run + credential import + smoke test
-node ui/server.mjs         # web console on http://127.0.0.1:8090 (token printed)
+ui/start.sh         # web console on http://127.0.0.1:8090 (token printed)
 ./omp-remote "prompt"      # or drive it from the terminal
 ```
 
