@@ -178,9 +178,15 @@ async function handleHealth(res) {
 
 async function handleListWorkspaces(res) {
   await fsp.mkdir(WORKSPACES, { recursive: true });
+  // live mounts (run/mounts.json) are working directories too — surface them
+  let mounts = [];
+  try {
+    mounts = JSON.parse(await fsp.readFile(MOUNTS_FILE, "utf8"));
+  } catch {}
+  const mountNames = new Set(mounts.map((m) => m.container.replace("/workspaces/", "")));
   const entries = await fsp.readdir(WORKSPACES, { withFileTypes: true });
   const out = [];
-  for (const e of entries.filter((d) => d.isDirectory() && !d.name.startsWith("."))) {
+  for (const e of entries.filter((d) => d.isDirectory() && !d.name.startsWith(".") && !mountNames.has(d.name))) {
     const dir = path.join(WORKSPACES, e.name);
     // only treat the workspace itself as a repo — never a parent (git walks up)
     const isRepo = isGitRepo(dir);
@@ -195,11 +201,6 @@ async function handleListWorkspaces(res) {
     } catch {}
     out.push({ name: e.name, git: isRepo, remote, mtime });
   }
-  // live mounts (run/mounts.json) are working directories too — surface them
-  let mounts = [];
-  try {
-    mounts = JSON.parse(await fsp.readFile(MOUNTS_FILE, "utf8"));
-  } catch {}
   for (const m of mounts) out.push({ name: m.container.replace("/workspaces/", ""), mount: true, host: m.host });
   send(res, 200, { workspaces: out });
 }
@@ -247,7 +248,15 @@ async function handleMount(res, body) {
 	} catch {}
 	if (health?.busy > 0) return sendErr(res, 409, "busy", "a turn is running — abort it first, then mount");
 
-	const r = await new Promise((resolve) => {
+	const r = await recreateContainer();
+	if (r.code !== 0)
+		return sendErr(res, 502, "mount_failed", "container recreation failed", { output: r.out });
+	return send(res, 200, { ok: true, hostPath: src, containerPath, note: "live mount — agent edits land in the original directory" });
+}
+
+
+function recreateContainer() {
+	return new Promise((resolve) => {
 		const p = spawn("bash", [path.join(SIM_ROOT, "deploy.sh")], {
 			env: { ...process.env, OMP_API_TOKEN: containerToken(), IMPORT_HOST_OMP_CONFIG: "0" },
 		});
@@ -264,11 +273,7 @@ async function handleMount(res, body) {
 			resolve({ code: -1, out: String(e) });
 		});
 	});
-	if (r.code !== 0)
-		return sendErr(res, 502, "mount_failed", "container recreation failed", { output: r.out });
-	return send(res, 200, { ok: true, hostPath: src, containerPath, note: "live mount — agent edits land in the original directory" });
 }
-
 async function handleSeed(res, body) {
   const { type, name } = body ?? {};
   const dest = workspacePath(name);
@@ -302,26 +307,34 @@ async function handleSeed(res, body) {
 }
 
 async function handleWorkspaceAction(res, name, action, body) {
-  const dir = workspacePath(name);
-  if (!dir) return sendErr(res, 400, "bad_name", "invalid workspace name");
-  if (!(await fsp.stat(dir).then(() => true, () => false)))
-    return sendErr(res, 404, "not_found", `workspace '${name}' does not exist`);
+  // two kinds of workspaces: host directories under run/workspaces, and
+  // live mounts (run/mounts.json — container binds the original host dir)
+  let mounts = [];
+  try {
+    mounts = JSON.parse(await fsp.readFile(MOUNTS_FILE, "utf8"));
+  } catch {}
+  const mount = mounts.find((m) => m.container === `/workspaces/${name}`);
+  const hostDir = mount ? mount.host : workspacePath(name);
+  const exists = mount
+    ? true
+    : hostDir && (await fsp.stat(hostDir).then(() => true, () => false));
+  if (!exists) return sendErr(res, 404, "not_found", `workspace '${name}' does not exist`);
+
+  const git = (...args) => runGit(args, { cwd: hostDir, timeoutMs: 300_000 });
 
   if (action === "update") {
-    if (!isGitRepo(dir))
+    if (!mount && !isGitRepo(hostDir))
       return sendErr(res, 400, "not_git", "workspace is not a git repository");
-    const r = await runGit(["pull", "--ff-only"], { cwd: dir, timeoutMs: 120_000 });
+    const r = await runGit(["pull", "--ff-only"], { cwd: hostDir, timeoutMs: 120_000 });
     if (r.code !== 0)
       return sendErr(res, 502, "pull_failed", "git pull failed", { stderr: (r.err + r.out).slice(-1500) });
     return send(res, 200, { ok: true, output: (r.out + r.err).slice(-1500) });
   }
 
   if (action === "push") {
-    const isRepo = isGitRepo(dir);
-    if (!isRepo && !body?.remote)
+    if (!isGitRepo(hostDir) && !body?.remote)
       return sendErr(res, 400, "no_remote", "workspace is not a git repo — provide remote (GitHub repo URL) to publish it");
-    const git = (...args) => runGit(args, { cwd: dir, timeoutMs: 300_000 });
-    if (!isRepo) {
+    if (!isGitRepo(hostDir)) {
       const init = await git(["init", "-b", "main"]);
       if (init.code !== 0) return sendErr(res, 500, "init_failed", "git init failed", { stderr: init.err.slice(-800) });
       await git(["remote", "add", "origin", body.remote]);
@@ -349,13 +362,24 @@ async function handleWorkspaceAction(res, name, action, body) {
       if (!body?.overwrite) return sendErr(res, 409, "dest_exists", "destination exists", { hint: "set overwrite: true to merge into it" });
     }
     await fsp.mkdir(dest, { recursive: true });
-    await fsp.cp(dir, dest, { recursive: true, force: true, filter: (s) => !/(^|[/\\])node_modules([/\\]|$)/.test(s) });
+    await fsp.cp(hostDir, dest, { recursive: true, force: true, filter: (s) => !/(^|[/\\])node_modules([/\\]|$)/.test(s) });
     return send(res, 200, { ok: true, exported: dest });
   }
 
   if (action === "remove") {
+    if (mount) {
+      // live mount: detach only — the original directory is never touched
+      const remaining = mounts.filter((m) => m.container !== `/workspaces/${name}`);
+      await fsp.writeFile(MOUNTS_FILE, JSON.stringify(remaining, null, 2));
+      const r = await recreateContainer();
+      if (r.code !== 0) {
+        await fsp.writeFile(MOUNTS_FILE, JSON.stringify(mounts, null, 2)); // roll back
+        return sendErr(res, 502, "detach_failed", "container recreation failed", { output: r.out });
+      }
+      return send(res, 200, { ok: true, note: "live mount detached — files in the original directory are untouched" });
+    }
     try {
-      await fsp.rm(dir, { recursive: true, force: true });
+      await fsp.rm(hostDir, { recursive: true, force: true });
     } catch {
       // legacy root-owned files (pre non-root container) — clear from inside
       const cleaned = await new Promise((resolve) => {
@@ -363,8 +387,8 @@ async function handleWorkspaceAction(res, name, action, body) {
         p.on("close", (code) => resolve(code === 0));
         p.on("error", () => resolve(false));
       });
-      await fsp.rm(dir, { recursive: true, force: true }).catch(() => {});
-      if (await fsp.stat(dir).then(() => true, () => false))
+      await fsp.rm(hostDir, { recursive: true, force: true }).catch(() => {});
+      if (await fsp.stat(hostDir).then(() => true, () => false))
         return sendErr(res, 500, "remove_failed", "could not fully remove workspace", {
           hint: cleaned
             ? "container cleanup ran but files remain — check sim/run/workspaces permissions"
