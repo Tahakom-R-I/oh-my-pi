@@ -29,6 +29,7 @@ const PORT = Number(process.env.OMP_UI_PORT ?? 8090);
 const HOST = process.env.OMP_UI_HOST ?? "127.0.0.1";
 const CONTAINER_BASE = process.env.OMP_API_URL ?? "http://127.0.0.1:8080";
 const CONTAINER_NAME = process.env.OMP_CONTAINER ?? "omp-vm";
+const MOUNTS_FILE = path.join(SIM_ROOT, "run", "mounts.json");
 const NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const JSON_TIMEOUT = 30_000;
 
@@ -194,6 +195,71 @@ async function handleListWorkspaces(res) {
     out.push({ name: e.name, git: isRepo, remote, mtime });
   }
   send(res, 200, { workspaces: out });
+}
+/**
+ * Live-mount a host directory into the running container: records the mount
+ * in run/mounts.json (so redeploys re-attach it) and recreates the container
+ * to attach it (sessions auto-resume from their transcripts). Refuses while
+ * a turn is running — recreating would kill it.
+ */
+function slugify(s) {
+	return (s.replace(/[^A-Za-z0-9._-]/g, "-").replace(/^-+|-+$/g, "").slice(0, 40) || "mnt");
+}
+
+async function handleMount(res, body) {
+	const srcRaw = body?.path ?? "";
+	let src;
+	try {
+		src = path.resolve(srcRaw);
+		await fsp.access(src);
+	} catch {
+		return sendErr(res, 400, "bad_path", `not an accessible directory: ${srcRaw}`);
+	}
+	if ((await fsp.stat(src)).isDirectory() !== true)
+		return sendErr(res, 400, "bad_path", `not a directory: ${src}`);
+	const simResolved = path.resolve(SIM_ROOT);
+	if (src === simResolved || src.startsWith(simResolved + path.sep))
+		return sendErr(res, 400, "forbidden_path", "refusing to mount a directory inside the deployment folder");
+
+	let containerPath = `/workspaces/mnt-${slugify(path.basename(src))}`;
+	let mounts = [];
+	try {
+		mounts = JSON.parse(await fsp.readFile(MOUNTS_FILE, "utf8"));
+	} catch {}
+	let n = 2;
+	while (mounts.some((m) => m.container === containerPath && m.host !== src))
+		containerPath = `/workspaces/mnt-${slugify(path.basename(src))}-${n++}`;
+	mounts = mounts.filter((m) => m.container !== containerPath);
+	mounts.push({ host: src, container: containerPath });
+	await fsp.mkdir(path.dirname(MOUNTS_FILE), { recursive: true });
+	await fsp.writeFile(MOUNTS_FILE, JSON.stringify(mounts, null, 2));
+
+	let health = null;
+	try {
+		health = await fetch(`${CONTAINER_BASE}/healthz`, { signal: AbortSignal.timeout(3000) }).then((r) => r.json());
+	} catch {}
+	if (health?.busy > 0) return sendErr(res, 409, "busy", "a turn is running — abort it first, then mount");
+
+	const r = await new Promise((resolve) => {
+		const p = spawn("bash", [path.join(SIM_ROOT, "deploy.sh")], {
+			env: { ...process.env, OMP_API_TOKEN: containerToken(), IMPORT_HOST_OMP_CONFIG: "0" },
+		});
+		let out = "";
+		p.stdout.on("data", (d) => (out += d));
+		p.stderr.on("data", (d) => (out += d));
+		const timer = setTimeout(() => p.kill("SIGKILL"), 300_000);
+		p.on("close", (code) => {
+			clearTimeout(timer);
+			resolve({ code, out: out.slice(-1500) });
+		});
+		p.on("error", (e) => {
+			clearTimeout(timer);
+			resolve({ code: -1, out: String(e) });
+		});
+	});
+	if (r.code !== 0)
+		return sendErr(res, 502, "mount_failed", "container recreation failed", { output: r.out });
+	return send(res, 200, { ok: true, hostPath: src, containerPath, note: "live mount — agent edits land in the original directory" });
 }
 
 async function handleSeed(res, body) {
@@ -441,6 +507,7 @@ const server = http.createServer(async (req, res) => {
     if (!hasValidAuth(req)) return sendErr(res, 401, "unauthorized", "login required");
 
     if (p === "/api/health" && req.method === "GET") return await handleHealth(res);
+    if (p === "/api/mount" && req.method === "POST") return await handleMount(res, await readBody(req));
     if (p === "/api/workspaces" && req.method === "GET") return await handleListWorkspaces(res);
     if (p === "/api/seed" && req.method === "POST") return await handleSeed(res, await readBody(req));
 

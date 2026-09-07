@@ -10,9 +10,11 @@
  *   - process-level unhandledRejection/uncaughtException logging (no silent death)
  *   - idle session eviction (sessions are durable + resumable, so eviction is safe)
  *   - prompt size cap, per-request structured logging with duration
+ *   - session cwd allowlist (CWD_ROOTS) — clients can only target mounted volumes
  *   - cwd reported on session GET
  */
 import * as fs from "node:fs/promises";
+import * as path from "node:path";
 import { existsSync } from "node:fs";
 import { timingSafeEqual } from "node:crypto";
 import {
@@ -30,6 +32,12 @@ const IDLE_MINUTES = Number(process.env.OMP_SESSION_IDLE_MINUTES ?? 30);
 const IDLE_MS = Math.max(1, IDLE_MINUTES) * 60_000;
 const GIT_BRIDGE = process.env.GIT_BRIDGE ?? "/git-bridge/project.git";
 const GIT_WORKSPACE = "/workspaces/git/project";
+// session working directories must live under one of these container roots
+// (the mounted volumes) — a client can never point a session at /etc, /root, …
+const CWD_ROOTS = (process.env.CWD_ROOTS ?? "/workspaces,/projects")
+	.split(",")
+	.map((r) => r.trim())
+	.filter(Boolean);
 const enc = new TextEncoder();
 
 interface Sess {
@@ -176,7 +184,14 @@ async function handle(req: Request): Promise<Response> {
 	if (req.method === "POST" && url.pathname === "/v1/sessions") {
 		const body = (await req.json().catch(() => ({}))) as { cwd?: string; resume?: string; gitBridge?: boolean };
 		const sessionId = crypto.randomUUID();
-		const cwd = body.gitBridge ? GIT_WORKSPACE : (body.cwd ?? `${WORKSPACES}/${sessionId}`);
+		const requestedCwd = body.gitBridge ? GIT_WORKSPACE : (body.cwd ?? `${WORKSPACES}/${sessionId}`);
+		const normCwd = path.resolve(requestedCwd);
+		if (!CWD_ROOTS.some((root) => normCwd === root || normCwd.startsWith(root + "/")))
+			return json(
+				{ error: { code: "cwd_forbidden", message: `cwd must be under one of: ${CWD_ROOTS.join(", ")}` } },
+				403,
+			);
+		const cwd = normCwd;
 		await fs.mkdir(cwd, { recursive: true });
 		if (body.gitBridge) await ensureGitWorkspace(cwd);
 		const { session, registry, modelFallbackMessage } = await createSession(cwd, body.resume);

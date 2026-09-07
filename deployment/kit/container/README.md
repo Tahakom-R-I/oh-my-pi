@@ -17,13 +17,14 @@ recommended path for pure terminal use; choose this variant when you need
 
 | Path | Purpose |
 |---|---|
-| `Dockerfile` | Image: Debian slim + Bun + `@oh-my-pi/pi-coding-agent` (npm) + the HTTP wrapper (`server.ts`) |
-| `server.ts` | Wrapper API: bearer auth, sessions, SSE prompt streaming, steer/abort, git-bridge publish, CORS |
-| `deploy.sh` | One-command lifecycle: build → run (host-UID mapped volumes) → health wait → smoke test. `--down` / `--clean` |
+| `Dockerfile` | Image: Debian slim + Bun (pinned) + `@oh-my-pi/pi-coding-agent` (npm) + the HTTP wrapper (`server.ts`) |
+| `server.ts` | Wrapper API: bearer auth, sessions, SSE prompt streaming, steer/abort, git-bridge publish, CORS, cwd allowlist |
+| `deploy.sh` | One-command lifecycle: build → run (host-UID mapped volumes) → port pre-flight → health wait → smoke test. `--down` / `--clean` |
 | `omp-remote` | Terminal client (python3 + curl): persistent sessions, full agent view (thinking, tools, todos), auto-resume |
 | `git-bridge` | Commit-based code sync with machines outside the host (`seed/push/pull/log/reset`) |
 | `ui/` | Web console backend + frontend (vanilla JS, no build step) |
 | `ui/.ui-token` | Web console login token (auto-generated — distinct from the container API token in `run/token`) |
+| `run/mounts.json` | Persistent extra bind mounts (added via the web console live-mount) |
 | `ARCHITECTURE.md` | Full design document: request lifetime, multi-tenancy, hardening, scaling paths |
 
 Runtime state lives in `run/` next to this folder (created on first deploy):
@@ -35,47 +36,53 @@ credential vault + sessions (`state/.omp`), per-session workspaces
 - Docker Engine ≥ 24 on a Linux host; `git`, `jq`, `sqlite3`, `curl`, `openssl` on the host.
 - Outbound network from the host/container to your LLM provider.
 - omp provider credentials: either an existing `~/.omp/agent/agent.db` on the
-  host (imported automatically at deploy — see §4), provider API keys in the
-  environment, or a central `omp auth-broker` (kit §5).
+  host (imported at deploy with `IMPORT_HOST_OMP_CONFIG=1` — see §4), provider
+  API keys in the environment, or a central `omp auth-broker` (kit §5).
 
 ## 3. Deploy
 
 ```sh
 cd container/
-./deploy.sh                     # build, run, import host omp creds, smoke test
+./deploy.sh                     # build, run, smoke test
 ```
 
-Idempotent. What you get: container `omp-server` on port 8080, API bearer
-token in `run/token`, and a smoke test that proves a model round-trip.
-Useful env: `PORT=…`, `OMP_API_TOKEN=<hex>` (reuse a token),
-`IMPORT_HOST_OMP_CONFIG=0` (skip credential import), `LOCAL_PROJECT=<dir>`
-(bind-mount a host directory at `/workspaces/project`),
-`OMP_APPROVAL=restricted` (require approval for write/exec tools instead of
-yolo), `OMP_SESSION_IDLE_MINUTES=30` (idle session eviction),
-`OMP_OTEL=1` (OpenTelemetry spans — exporter setup is the host's).
+Idempotent: the pre-flight detects whether port 8080 is held by this
+deployment's own previous container (replaced automatically) or by a foreign
+service (clear error). Useful env:
+
+- `PORT=…` — publish on another host port
+- `OMP_API_TOKEN=<hex>` — reuse a token instead of generating one
+- `IMPORT_HOST_OMP_CONFIG=1` — snapshot host omp credentials into the container state
+- `PROJECTS_ROOT=<host-dir>` — mount a whole host tree at `/projects`: any
+  directory under it becomes a dynamic working directory, no restarts
+- `LOCAL_PROJECT=<dir>` — bind-mount one host directory at `/workspaces/project`
+- `OMP_APPROVAL=restricted` — require approval for write/exec tools instead of yolo
+- `OMP_SESSION_IDLE_MINUTES=30` — idle session eviction (safe: transcripts are durable)
+- `OMP_OTEL=1` — OpenTelemetry spans (exporter setup is the host's)
 
 Teardown: `./deploy.sh --down` (keep state) · `--clean` (wipe everything).
 
 ## 4. Credentials
 
-At deploy time the script snapshots the host's omp credentials into the
-container state volume: `sqlite3 ~/.omp/agent/agent.db ".backup …"` plus
-`config.yml` / `models.yml` / `models.db`. The container therefore uses the
-same providers/models as the host user. Cloud analog: Secret Manager
-injection or the `omp auth-broker` vault (kit §5). Skip the import with
-`IMPORT_HOST_OMP_CONFIG=0` and pass provider keys via environment instead
-(`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `ZAI_API_KEY`, … — see
-`config/agent.env.example` for the full list).
+With `IMPORT_HOST_OMP_CONFIG=1` (admin workstation only) the deploy script
+snapshots the host's omp credentials into the container state volume:
+`sqlite3 ~/.omp/agent/agent.db ".backup …"` plus `config.yml` / `models.yml` /
+`models.db`. The container then uses the same providers/models as the host
+user. Cloud analog: Secret Manager injection or the `omp auth-broker` vault
+(kit §5). Otherwise pass provider keys via environment (`OPENAI_API_KEY`,
+`ANTHROPIC_API_KEY`, `ZAI_API_KEY`, …) — see `config/agent.env.example`.
 
 ## 5. Clients
 
 **Web console** — `node ui/server.mjs` (host side; Node ≥ 20, zero deps).
-Prints its URL and UI token. Features: workspace seeding (git URL clone or
-host-directory snapshot), session start/steer/abort, live prompt streaming
-(thinking, tool calls with output, todo lists, retries), workspace
-export back to a host directory. The container token stays server-side.
+Prints its URL and login token. Features: workspace seeding (git URL clone,
+local-directory **live mount**, or local-directory snapshot), session
+start/steer/abort, live prompt streaming (thinking, tool calls with output,
+todo lists, retries), workspace export back to a host directory. The
+container token stays server-side.
 
-Note: the console login token is `ui/.ui-token` (printed at UI startup) — distinct from the container API token (`run/token`).
+Note: the console login token is `ui/.ui-token` (printed at UI startup) —
+distinct from the container API token (`run/token`).
 
 **Terminal** — `./omp-remote "prompt"` from the host (or anywhere that can
 reach the API; override `OMP_REMOTE_URL`/`OMP_REMOTE_TOKEN`):
@@ -94,15 +101,20 @@ resumes from the persisted transcript (`SessionManager.open`).
 thinking, tool-call, and text-delta events, `event: done` terminator).
 `GET /healthz` is the only unauthenticated route.
 
-## 6. Getting work in and out
+## 6. Working on local directories
 
-| Direction | Mechanism |
-|---|---|
-| Repo in → workspace | Web console seed (git URL), or `git clone` into `run/workspaces/<name>` on the host (bind-mounted at `/workspaces/<name>`) |
-| Host directory → workspace | Web console seed (local-directory snapshot), or `LOCAL_PROJECT=<dir>` bind mount at deploy |
-| Workspace → host directory | Web console ⇩ export, or `git push` + host `git pull` |
-| Continuous, cross-device | Git bridge (§`git-bridge`): agent commits/pushes to the bare repo, host pulls — text-only, no shared filesystem |
-| Live same-machine editing | The workspace *is* a host directory (bind mount) — open it in your editor directly |
+Three ways to point the agent at host code, in increasing fidelity:
+
+| Mechanism | How | Behavior |
+|---|---|---|
+| **Snapshot** (web console, "snapshot copy") | copies a host directory into `run/workspaces/<name>` | one-time import; result comes back via ⇩ export or git |
+| **Live mount** (web console, "live mount") | records the directory in `run/mounts.json` and recreates the container with it bound at `/workspaces/mnt-<name>` | agent edits land **in the original directory**; mount persists across redeploys |
+| **Projects root** (`PROJECTS_ROOT=<dir>` at deploy) | mounts a whole host tree at `/projects` | every directory under it is dynamically available as `/projects/<name>` — no restarts, new folders appear automatically |
+
+Live mount notes: the container is recreated to attach the new bind (takes a
+few seconds; refused while a turn is running — sessions resume afterwards);
+mounts persist via `run/mounts.json` across redeploys; one mount per unique
+directory. For whole-tree access prefer `PROJECTS_ROOT`.
 
 ## 7. Operations
 
@@ -122,14 +134,18 @@ Common issues:
 
 | Symptom | Fix |
 |---|---|
-| `deploy.sh`: port 8080 already in use | another service holds it — stop it, or `PORT=<free port> ./deploy.sh`. A foreign holder aborts the deploy; the script replaces only its own previous deployment |
+| `deploy.sh`: port 8080 already in use | a foreign service holds it — stop it, or `PORT=<free port> ./deploy.sh`. The script replaces only its own previous deployment |
 | Web console login rejects the API token | the console uses its own token: `ui/.ui-token` (printed at UI startup) — not `run/token` |
 | 401/`not_found` in the console after a redeploy | the browser tab held a session that died with the old container — reload the page and send the prompt again; it auto-resumes from the transcript or starts fresh |
 | UI shows "container unreachable" after `--clean` | expected: the deployment was wiped — `./deploy.sh` to bring it back |
+| Live mount fails with "a turn is running" | abort the running turn first — mounting recreates the container |
 
 ## 8. Security notes
 
 - All `/v1/*` routes require the bearer token; `GET /healthz` does not.
+- Session working directories are restricted to the mounted volumes
+  (`CWD_ROOTS`, default `/workspaces` + `/projects`) — a client can never
+  point a session at `/etc`, `/root`, or arbitrary container paths.
 - The agent runs with tool approval **yolo** inside the container sandbox —
   the isolation boundary is the container, not the approval layer. Set
   `OMP_APPROVAL=restricted` for `tools.approvalMode: write`, and/or add
@@ -142,6 +158,7 @@ Common issues:
 - Binding beyond `127.0.0.1`/loopback requires a real gateway (IAP/OIDC,
   authenticating reverse proxy, or VPN). The web console is localhost-only
   by default; its UI token gates the API proxy, not the public internet.
+- `run/` (credentials, transcripts, tokens) is gitignored — never commit it.
 
 ## 9. Design document
 
@@ -149,4 +166,4 @@ Common issues:
 model (durable transcripts + resumable sessions), multi-tenancy options,
 scaling directions, and the hardening checklist — everything marked
 **[verified]** was exercised end to end (seed → prompt → tool execution →
-sync → restart-resume).
+sync → restart-resume → live-mount editing in the original directory).

@@ -106,6 +106,25 @@ for passthrough in OMP_SESSION_IDLE_MINUTES OMP_APPROVAL OMP_OTEL; do
 	[[ -n ${!passthrough:-} ]] && ENV_ARGS+=(-e "$passthrough=${!passthrough}")
 done
 MOUNT_ARGS=()
+
+# Persistent extra mounts recorded by the web console / API (run/mounts.json)
+if [[ -f "$RUN_DIR/mounts.json" ]]; then
+	while IFS=$'\t' read -r host container; do
+		[[ -n $host && -d $host ]] || continue
+		MOUNT_ARGS+=(-v "$host:$container")
+		echo ">> mounting $host -> $container"
+	done < <(jq -r '.[] | "\(.host)\t\(.container)"' "$RUN_DIR/mounts.json" 2>/dev/null)
+fi
+
+# Projects root: one rw mount exposing a whole host tree at /projects —
+# any directory under it becomes a dynamic working directory, no restarts.
+if [[ -n ${PROJECTS_ROOT:-} ]]; then
+	PR=$(realpath "$PROJECTS_ROOT")
+	[[ -d $PR ]] || die "PROJECTS_ROOT is not a directory: $PROJECTS_ROOT"
+	MOUNT_ARGS+=(-v "$PR:/projects")
+	echo ">> projects root: $PR -> /projects (dynamic working directories)"
+fi
+
 if [[ -n ${LOCAL_PROJECT:-} ]]; then
 	HOST_PROJECT=$(realpath "$LOCAL_PROJECT")
 	[[ -d $HOST_PROJECT ]] || die "LOCAL_PROJECT is not a directory: $LOCAL_PROJECT"

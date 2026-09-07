@@ -210,19 +210,57 @@ function setSeedTab(tab) {
   $("#tab-local").classList.toggle("active", tab === "local");
   $("#seed-url").classList.toggle("hidden", tab !== "git");
   $("#seed-path").classList.toggle("hidden", tab !== "local");
+  $("#local-mode").classList.toggle("hidden", tab !== "local");
+  $("#seed-name").classList.toggle("hidden", tab === "local" && localSeedMode() === "mount");
   $("#seed-note").textContent = tab === "git"
     ? "Clones the repo into the container's shared workspaces volume."
-    : "Copies a snapshot of a host directory into the container (container edits are visible live on the host).";
+    : localSeedMode() === "mount"
+      ? "Live mount: the container works directly in the original directory — no copies."
+      : "Copies a snapshot of a host directory into the container (container edits are visible live on the host).";
 }
+
+function localSeedMode() {
+  return document.querySelector('input[name="localmode"]:checked')?.value ?? "mount";
+}
+
+document.querySelectorAll('input[name="localmode"]').forEach((r) =>
+  r.addEventListener("change", () => setSeedTab("local")),
+);
 
 $("#seed-form").addEventListener("submit", async (e) => {
   e.preventDefault();
-  const name = $("#seed-name").value.trim();
-  if (!name) return;
-  const body = seedTab === "git" ? { type: "git", name, url: $("#seed-url").value.trim() } : { type: "local", name, path: $("#seed-path").value.trim() };
   const btn = $("#seed-form").querySelector("button[type=submit]");
   btn.disabled = true;
   try {
+    if (seedTab === "local") {
+      const p = $("#seed-path").value.trim();
+      if (!p) { toast("enter a host directory path", true); return; }
+      if (localSeedMode() === "mount") {
+        // live mount: recreate the container with the directory attached,
+        // then start a session working directly in the original location
+        const { resp, data } = await jfetch("/api/mount", { method: "POST", body: { path: p } }, 300000);
+        if (!resp.ok) { toast(data?.error?.message ?? `HTTP ${resp.status}`, true); return; }
+        toast(`live-mounted ${data.hostPath}`);
+        state.workspace = data.hostPath.split("/").filter(Boolean).pop();
+        $("#seed-path").value = "";
+        await refreshWorkspaces();
+        await startSession(state.workspace, data.containerPath);
+      } else {
+        const name = $("#seed-name").value.trim();
+        if (!name) { toast("workspace name required", true); return; }
+        const { resp, data } = await jfetch("/api/seed", { method: "POST", body: { type: "local", name, path: p } }, 600000);
+        if (!resp.ok) { toast(data?.error?.message ?? `HTTP ${resp.status}`, true); return; }
+        toast(`workspace '${name}' seeded`);
+        $("#seed-name").value = "";
+        state.workspace = name;
+        await refreshWorkspaces();
+      }
+      return;
+    }
+    // git tab
+    const name = $("#seed-name").value.trim();
+    if (!name) return;
+    const body = { type: "git", name, url: $("#seed-url").value.trim() };
     const { resp, data } = await jfetch("/api/seed", { method: "POST", body }, 600000);
     if (!resp.ok) { toast(data?.error?.message ?? `HTTP ${resp.status}`, true); return; }
     toast(`workspace '${name}' seeded`);
@@ -295,10 +333,13 @@ function restoreSession() {
   } catch {}
 }
 
-async function startSession(workspace) {
+async function startSession(workspace, cwdOverride) {
   if (!workspace) { toast("select a workspace first", true); return; }
   try {
-    const { resp, data } = await jfetch("/api/sessions", { method: "POST", body: { cwd: `/workspaces/${workspace}` } });
+    const { resp, data } = await jfetch("/api/sessions", {
+      method: "POST",
+      body: { cwd: cwdOverride ?? `/workspaces/${workspace}` },
+    });
     if (!resp.ok) { toast(data?.error?.message ?? `HTTP ${resp.status}`, true); return; }
     state.sessionId = data.sessionId;
     state.cwd = data.cwd;
