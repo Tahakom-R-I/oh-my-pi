@@ -38,10 +38,10 @@
           <button id="tab-git" class="tab active" type="button">Git URL</button>
           <button id="tab-local" class="tab" type="button">Local directory</button>
         </div>
-        <form id="seed-form">
+        <form id="seed-form" novalidate>
           <input id="seed-url" placeholder="https://github.com/user/repo.git">
           <input id="seed-path" placeholder="/home/you/projects/myapp" class="hidden">
-          <input id="seed-name" placeholder="workspace name" required>
+          <input id="seed-name" placeholder="workspace name">
           <button type="submit" class="primary">Seed into container</button>
           <p id="seed-note" class="muted small">Clones the repo into the container's shared workspaces volume.</p>
         </form>
