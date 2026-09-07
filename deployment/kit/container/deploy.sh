@@ -191,7 +191,7 @@ echo
 echo "deployment: $NAME"
 echo "API:       $BASE   (healthz, /v1/sessions, /v1/sessions/:id/prompt)"
 echo "Token:     $TOKEN   (saved in $RUN_DIR/token)"
-echo "Web UI:    node ui/server.mjs   (http://localhost:8090 — login token in ui/.ui-token)"
+echo "Web UI:    ui/start.sh   (http://localhost:8090 — login token in ui/.ui-token)"
 echo "Try:       curl -sS -H \"Authorization: Bearer \$(cat $RUN_DIR/token)\" $BASE/healthz"
 echo "Logs:      docker logs -f $NAME"
 echo "Teardown:  deploy.sh --down   (or --clean to wipe everything)"
