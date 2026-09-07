@@ -1,0 +1,8 @@
+{
+  "name": "omp-api-sim",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@oh-my-pi/pi-coding-agent": "18.1.11"
+  }
+}

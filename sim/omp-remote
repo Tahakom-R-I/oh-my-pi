@@ -1,0 +1,371 @@
+#!/usr/bin/env python3
+"""omp-remote — maintain a session and talk to the omp container from the terminal.
+
+Usage:
+  omp-remote "prompt"          send a prompt, stream the full agent view (same session every time)
+  cat file | omp-remote -      read the prompt from stdin
+  omp-remote --quiet "prompt"  minimal view: only the assistant's text answer
+  omp-remote --new             abandon the current session (fresh one on next prompt)
+  omp-remote --steer "text"    steer the currently running turn
+  omp-remote --abort           abort the currently running turn
+  omp-remote --status          show session info
+  omp-remote --raw "prompt"    dump raw SSE frames (for debugging / other clients)
+  omp-remote --git "prompt"    work in the git-bridge workspace (/workspaces/git/project)
+  omp-remote --sync            commit+push container edits, pull host edits (git bridge)
+
+The default view streams everything the agent does, like watching the native omp
+terminal: the model's thinking, each tool call with its live output, todo lists,
+retries, compaction, notices — plus the final answer.
+
+Env:
+  OMP_REMOTE_URL     API base (default http://localhost:8080)
+  OMP_REMOTE_TOKEN   bearer token (default: contents of <script dir>/run/token)
+  OMP_REMOTE_STATE   session state file (default ~/.local/state/omp-remote/session.json)
+  NO_COLOR           disable ANSI colors
+"""
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+URL = os.environ.get("OMP_REMOTE_URL", "http://localhost:8080").rstrip("/")
+_token_file = SCRIPT_DIR / "run" / "token"
+TOKEN = os.environ.get("OMP_REMOTE_TOKEN") or (_token_file.read_text().strip() if _token_file.exists() else "")
+STATE = Path(os.environ.get("OMP_REMOTE_STATE", Path.home() / ".local/state/omp-remote/session.json"))
+USE_COLOR = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+DIM = "\033[2m" if USE_COLOR else ""
+ITAL = "\033[2;3m" if USE_COLOR else ""
+CYAN = "\033[36m" if USE_COLOR else ""
+RED = "\033[31m" if USE_COLOR else ""
+YEL = "\033[33m" if USE_COLOR else ""
+GRN = "\033[32m" if USE_COLOR else ""
+RESET = "\033[0m" if USE_COLOR else ""
+MAX_TOOL_OUTPUT = 2000  # per tool call, chars of live output to print
+
+
+def fail(msg, code=1):
+    print(f"omp-remote: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def api(method, path, body=None):
+    """Return (status, parsed_json_or_None). Never raises on HTTP errors."""
+    req = Request(
+        URL + path,
+        method=method,
+        data=json.dumps(body).encode() if body is not None else None,
+        headers={"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"},
+    )
+    try:
+        with urlopen(req, timeout=30) as resp:
+            raw = resp.read()
+            return resp.status, (json.loads(raw) if raw.strip() else None)
+    except HTTPError as e:
+        raw = e.read()
+        try:
+            return e.code, json.loads(raw) if raw.strip() else None
+        except json.JSONDecodeError:
+            return e.code, None
+
+
+def load_state():
+    try:
+        return json.loads(STATE.read_text())
+    except Exception:
+        return {}
+
+
+def save_state(st):
+    STATE.parent.mkdir(parents=True, exist_ok=True)
+    STATE.write_text(json.dumps(st))
+
+
+def create_session(resume=None, cwd=None, git=False):
+    body: dict = {}
+    if resume:
+        body = {"resume": resume["sessionFile"], "cwd": resume["cwd"]}
+        if git:
+            body["gitBridge"] = True
+    elif git:
+        body = {"gitBridge": True}
+    elif cwd:
+        body = {"cwd": cwd}
+    status, data = api("POST", "/v1/sessions", body)
+    if status == 201:
+        st = {"sessionId": data["sessionId"], "sessionFile": data.get("sessionFile"), "cwd": data.get("cwd"), "git": git}
+        save_state(st)
+        return st
+    if resume:  # stale resume (state wiped) -> fall back to a fresh session
+        return create_session(cwd=cwd, git=git)
+    fail(f"cannot create session ({status}): {data}")
+
+
+def ensure_session(cwd=None, git=False):
+    st = load_state()
+    if st.get("sessionId") and bool(st.get("git")) == git:
+        status, _ = api("GET", f"/v1/sessions/{st['sessionId']}")
+        if status == 200:
+            return st
+    if st and bool(st.get("git")) != git:
+        return create_session(git=git)  # mode switch: fresh session, no resume
+    return create_session(resume=st or None, cwd=cwd, git=git)
+
+
+def extract_opt(args, flag):
+    if flag in args:
+        i = args.index(flag)
+        if i + 1 >= len(args):
+            fail(f"{flag} needs a value")
+        val = args[i + 1]
+        del args[i:i + 2]
+        return val
+    return None
+
+
+def extract_flag(args, flag):
+    if flag in args:
+        args.remove(flag)
+        return True
+    return False
+
+
+def clip(value, limit=400):
+    s = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+    s = s.replace("\r", "")
+    return s if len(s) <= limit else s[:limit] + " …"
+
+
+def extract_text(value):
+    """Pull human-readable text out of a tool result (string or structured)."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        content = value.get("content")
+        if isinstance(content, list):
+            parts = [p.get("text", "") for p in content if isinstance(p, dict)]
+            joined = "\n".join(p for p in parts if p)
+            if joined:
+                return joined
+        for key in ("output", "text", "result", "message", "error"):
+            if value.get(key):
+                return str(value[key])
+    return json.dumps(value, ensure_ascii=False)
+
+
+class ToolView:
+    """Bounded live rendering of one tool execution."""
+
+    def __init__(self, name, args):
+        self.name = name
+        self.budget = MAX_TOOL_OUTPUT
+        self.printed = False
+
+    def header(self, args):
+        todos = args.get("todos")
+        if isinstance(todos, list) and todos:
+            render_todo_panel(todos, 1, 1)
+            return
+        what = args.get("i") or args.get("command") or args.get("path") or args.get("file_path") or ""
+        self.line(f"{CYAN}● {self.name}{RESET} {DIM}{clip(str(what), 120)}{RESET}")
+
+    def update(self, partial):
+        if self.budget <= 0:
+            return
+        text = clip(extract_text(partial), min(500, self.budget))
+        self.budget -= len(text)
+        self.printed = True
+        for ln in text.splitlines() or [""]:
+            self.line(f"{DIM}  │ {ln[:120]}{RESET}")
+
+    def end(self, result, is_error):
+        if self.budget <= 0:
+            self.line(f"{DIM}  … output truncated{RESET}")
+        if is_error:
+            self.line(f"{RED}  ✗ {clip(extract_text(result), 300)}{RESET}")
+        elif self.printed:
+            self.line(f"{DIM}  ✓ done{RESET}")
+
+    @staticmethod
+    def line(text):
+        print(text, flush=True)
+
+
+def render_todo_panel(todos, attempt, max_attempts):
+    icon = {"completed": f"{GRN}✓{RESET}", "in_progress": f"{CYAN}▸{RESET}", "blocked": f"{RED}!{RESET}",
+            "abandoned": f"{DIM}⊘{RESET}", "pending": f"{DIM}○{RESET}"}
+    print(f"{YEL}☰ todos{RESET} {DIM}(reminder {attempt}/{max_attempts}){RESET}", flush=True)
+    for t in todos:
+        mark = icon.get(t.get("status"), "○")
+        blocker = f" {DIM}(blocked: {t['blocker']}){RESET}" if t.get("blocker") else ""
+        print(f"  {mark} {t.get('content', '')}{blocker}", flush=True)
+
+
+def stream_prompt(session_id, text, mode="full", raw=False):
+    cmd = [
+        "curl", "-sS", "-N", "-m", "600",
+        "-H", f"Authorization: Bearer {TOKEN}",
+        "-H", "Content-Type: application/json",
+        "-d", json.dumps({"text": text}),
+        f"{URL}/v1/sessions/{session_id}/prompt",
+    ]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True)
+    rc = 1
+    current_event = None
+    need_newline = False
+    tools: dict = {}
+    assert proc.stdout is not None
+
+    def br():
+        nonlocal need_newline
+        if need_newline:
+            print()
+            need_newline = False
+
+    for line in proc.stdout:
+        line = line.rstrip("\n")
+        if line.startswith("event: "):
+            current_event = line[7:].strip()
+            continue
+        if not line.startswith("data: "):
+            continue
+        try:
+            ev = json.loads(line[6:].strip())
+        except json.JSONDecodeError:
+            continue
+        if raw:
+            print(line[6:].strip())
+            continue
+        if current_event == "error":
+            br()
+            print(f"{RED}omp error: {ev}{RESET}", file=sys.stderr)
+            break
+        if current_event == "done":
+            rc = 0
+            break
+        if not isinstance(ev, dict):
+            continue
+        etype = ev.get("type", "")
+        sub = (ev.get("assistantMessageEvent") or {}) if etype == "message_update" else {}
+        kind = sub.get("type", "")
+
+        if mode == "quiet":
+            if kind == "text_delta":
+                sys.stdout.write(sub.get("delta", ""))
+                sys.stdout.flush()
+                need_newline = True
+            continue
+
+        if kind == "thinking_start":
+            br()
+            print(f"{ITAL}── thinking ──{RESET}", flush=True)
+        elif kind == "thinking_delta":
+            sys.stdout.write(f"{ITAL}{sub.get('delta', '')}{RESET}")
+            sys.stdout.flush()
+            need_newline = True
+        elif kind == "thinking_end":
+            br()
+        elif kind == "text_delta":
+            sys.stdout.write(sub.get("delta", ""))
+            sys.stdout.flush()
+            need_newline = True
+        elif etype == "tool_execution_start":
+            br()
+            tv = ToolView(ev.get("toolName", "?"), ev.get("args") or {})
+            tools[ev.get("toolCallId")] = tv
+            tv.header(ev.get("args") or {})
+        elif etype == "tool_execution_update":
+            tv = tools.get(ev.get("toolCallId"))
+            if tv and ev.get("partialResult") not in (None, "", {}, []):
+                tv.update(ev["partialResult"])
+        elif etype == "tool_execution_end":
+            tv = tools.pop(ev.get("toolCallId"), None)
+            if tv:
+                tv.end(ev.get("result"), ev.get("isError", False))
+        elif etype == "todo_reminder":
+            br()
+            render_todo_panel(ev.get("todos", []), ev.get("attempt", 1), ev.get("maxAttempts", 1))
+        elif etype == "todo_auto_clear":
+            print(f"{DIM}— todo list cleared{RESET}", flush=True)
+        elif etype == "notice":
+            icon = {"info": f"{DIM}ℹ{RESET}", "warning": f"{YEL}⚠{RESET}", "error": f"{RED}✗{RESET}"}.get(ev.get("level"), "ℹ")
+            br()
+            print(f"{icon} {ev.get('message', '')}", flush=True)
+        elif etype == "auto_retry_start":
+            br()
+            print(f"{YEL}↻ retry {ev.get('attempt')}/{ev.get('maxAttempts')} in {ev.get('delayMs', 0) / 1000:.0f}s — {clip(ev.get('errorMessage', ''), 160)}{RESET}", flush=True)
+        elif etype == "auto_retry_end":
+            if ev.get("success"):
+                print(f"{DIM}↻ retry succeeded{RESET}", flush=True)
+            else:
+                print(f"{RED}↻ retry failed: {clip(ev.get('finalError', ''), 200)}{RESET}", flush=True)
+        elif etype == "auto_compaction_start":
+            br()
+            print(f"{DIM}⧉ compacting context ({ev.get('action')})…{RESET}", flush=True)
+        elif etype == "auto_compaction_end":
+            print(f"{DIM}⧉ compaction {'skipped' if ev.get('skipped') else 'done' if not ev.get('aborted') else 'aborted'}{RESET}", flush=True)
+        elif etype == "retry_fallback_applied":
+            print(f"{YEL}→ model fallback: {ev.get('from')} → {ev.get('to')}{RESET}", flush=True)
+
+    proc.wait()
+    br()
+    return rc if rc == 0 else (proc.returncode or 1)
+
+
+def main():
+    args = sys.argv[1:]
+    if not args:
+        fail(__doc__)
+    if args[0] == "--new":
+        STATE.unlink(missing_ok=True)
+        print("session reset — a fresh one starts on the next prompt")
+        return
+    if args[0] == "--status":
+        st = load_state()
+        if not st.get("sessionId"):
+            print("no session yet")
+            return
+        status, data = api("GET", f"/v1/sessions/{st['sessionId']}")
+        print(json.dumps({"state_file": str(STATE), "api_status": status, **st, **(data or {})}, indent=2))
+        return
+    if args[0] == "--sync":
+        st = load_state()
+        if not st.get("sessionId"):
+            fail("no session")
+        status, data = api("POST", f"/v1/sessions/{st['sessionId']}/sync")
+        print(json.dumps(data, indent=2))
+        sys.exit(0 if status < 400 else 1)
+    if args[0] in ("--abort", "--steer"):
+        st = load_state()
+        if not st.get("sessionId"):
+            fail("no session")
+        action = "/abort" if args[0] == "--abort" else "/steer"
+        body = {"text": " ".join(args[1:])} if action == "/steer" else None
+        status, data = api("POST", f"/v1/sessions/{st['sessionId']}{action}", body)
+        if status >= 400:
+            fail(f"{action} failed ({status}): {data}")
+        print(f"ok ({status})")
+        return
+    git = extract_flag(args, "--git")
+    quiet = extract_flag(args, "--quiet")
+    cwd = extract_opt(args, "--cwd")
+    if args and args[0] == "--raw":
+        st = ensure_session(cwd, git)
+        stream_prompt(st["sessionId"], " ".join(args[1:]), raw=True)
+        return
+
+    prompt = " ".join(args)
+    if prompt == "-":
+        prompt = sys.stdin.read()
+    if not prompt.strip():
+        fail("empty prompt")
+    st = ensure_session(cwd, git)
+    rc = stream_prompt(st["sessionId"], prompt, mode="quiet" if quiet else "full")
+    sys.exit(rc)
+
+
+if __name__ == "__main__":
+    main()
