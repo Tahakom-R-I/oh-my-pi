@@ -30,6 +30,7 @@ const HOST = process.env.OMP_UI_HOST ?? "127.0.0.1";
 const CONTAINER_BASE = process.env.OMP_API_URL ?? "http://127.0.0.1:8080";
 const CONTAINER_NAME = process.env.OMP_CONTAINER ?? "omp-vm";
 const MOUNTS_FILE = path.join(SIM_ROOT, "run", "mounts.json");
+const PID_FILE = path.join(__dirname, ".server-pid");
 const NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const JSON_TIMEOUT = 30_000;
 
@@ -557,14 +558,15 @@ server.on("error", (e) => {
 
 server.listen(PORT, HOST, () => {
   console.log(`omp UI:    http://${HOST}:${PORT}`);
+  fs.writeFileSync(PID_FILE, String(process.pid));
   console.log(`UI token:  ${UI_TOKEN}   (also in ${UI_TOKEN_FILE}; override with OMP_UI_TOKEN)`);
   console.log(`container: ${CONTAINER_BASE} (token from ${CONTAINER_TOKEN_FILE})`);
 });
 
 let shuttingDown = false;
 function shutdown() {
-  if (shuttingDown) return;
   shuttingDown = true;
+  fs.rmSync(PID_FILE, { force: true });
   console.log("omp UI: shutting down");
   server.close(() => process.exit(0));
   setTimeout(() => process.exit(0), 3000).unref();
