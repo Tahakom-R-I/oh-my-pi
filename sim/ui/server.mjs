@@ -28,9 +28,13 @@ const UI_TOKEN_FILE = path.join(__dirname, ".ui-token");
 const PORT = Number(process.env.OMP_UI_PORT ?? 8090);
 const HOST = process.env.OMP_UI_HOST ?? "127.0.0.1";
 const CONTAINER_BASE = process.env.OMP_API_URL ?? "http://127.0.0.1:8080";
-const CONTAINER_NAME = process.env.OMP_CONTAINER ?? "omp-vm";
+// must match the container name the deploy script creates (deploy.sh / simulate.sh)
+const CONTAINER_NAME = process.env.OMP_CONTAINER ?? "omp-server";
 const MOUNTS_FILE = path.join(SIM_ROOT, "run", "mounts.json");
 const PID_FILE = path.join(__dirname, ".server-pid");
+// Recreate script lives next to this folder: deploy.sh in the kit layout,
+// simulate.sh in the dev/sim layout. Resolved once at startup.
+const DEPLOY_SCRIPT = [path.join(SIM_ROOT, "deploy.sh"), path.join(SIM_ROOT, "simulate.sh")].find((f) => fs.existsSync(f));
 const NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const JSON_TIMEOUT = 30_000;
 
@@ -38,7 +42,16 @@ const JSON_TIMEOUT = 30_000;
 // auth
 // ---------------------------------------------------------------------------
 function uiToken() {
-  if (process.env.OMP_UI_TOKEN) return process.env.OMP_UI_TOKEN;
+  const env = process.env.OMP_UI_TOKEN;
+  if (env) {
+    // the cookie auth path captures [A-Za-z0-9]+ — refuse overrides the
+    // browser round-trip could never carry (punctuation breaks the login loop)
+    if (!/^[A-Za-z0-9]+$/.test(env)) {
+      console.error("OMP_UI_TOKEN must be alphanumeric ([A-Za-z0-9]) — e.g. openssl rand -hex 24");
+      process.exit(1);
+    }
+    return env;
+  }
   try {
     const t = fs.readFileSync(UI_TOKEN_FILE, "utf8").trim();
     if (t) return t;
@@ -229,35 +242,53 @@ async function handleMount(res, body) {
 	if (src === simResolved || src.startsWith(simResolved + path.sep))
 		return sendErr(res, 400, "forbidden_path", "refusing to mount a directory inside the deployment folder");
 
-	let containerPath = `/workspaces/mnt-${slugify(path.basename(src))}`;
-	let mounts = [];
-	try {
-		mounts = JSON.parse(await fsp.readFile(MOUNTS_FILE, "utf8"));
-	} catch {}
-	let n = 2;
-	while (mounts.some((m) => m.container === containerPath && m.host !== src))
-		containerPath = `/workspaces/mnt-${slugify(path.basename(src))}-${n++}`;
-	mounts = mounts.filter((m) => m.container !== containerPath);
-	mounts.push({ host: src, container: containerPath });
-	await fsp.mkdir(path.dirname(MOUNTS_FILE), { recursive: true });
-	await fsp.writeFile(MOUNTS_FILE, JSON.stringify(mounts, null, 2));
-
+	// refuse while a turn is running BEFORE touching mounts.json — a refused
+	// request must not leave a persisted record behind
 	let health = null;
 	try {
 		health = await fetch(`${CONTAINER_BASE}/healthz`, { signal: AbortSignal.timeout(3000) }).then((r) => r.json());
 	} catch {}
 	if (health?.busy > 0) return sendErr(res, 409, "busy", "a turn is running — abort it first, then mount");
 
+	// read the existing records, keep the raw text for rollback
+	let mountsRaw = null;
+	try {
+		mountsRaw = await fsp.readFile(MOUNTS_FILE, "utf8");
+	} catch {}
+	let mounts = [];
+	try {
+		mounts = JSON.parse(mountsRaw ?? "[]");
+	} catch {}
+
+	// pick a unique container path for this host directory
+	let containerPath = `/workspaces/mnt-${slugify(path.basename(src))}`;
+	let n = 2;
+	while (mounts.some((m) => m.container === containerPath && m.host !== src))
+		containerPath = `/workspaces/mnt-${slugify(path.basename(src))}-${n++}`;
+	mounts = mounts.filter((m) => m.container !== containerPath);
+	mounts.push({ host: src, container: containerPath });
+
+	await fsp.mkdir(path.dirname(MOUNTS_FILE), { recursive: true });
+	await fsp.writeFile(MOUNTS_FILE, JSON.stringify(mounts, null, 2));
+
 	const r = await recreateContainer();
-	if (r.code !== 0)
+	if (r.code !== 0) {
+		// roll back to the exact pre-request state (file or absence thereof)
+		if (mountsRaw === null) await fsp.rm(MOUNTS_FILE, { force: true });
+		else await fsp.writeFile(MOUNTS_FILE, mountsRaw);
 		return sendErr(res, 502, "mount_failed", "container recreation failed", { output: r.out });
+	}
 	return send(res, 200, { ok: true, hostPath: src, containerPath, note: "live mount — agent edits land in the original directory" });
 }
 
 
 function recreateContainer() {
 	return new Promise((resolve) => {
-		const p = spawn("bash", [path.join(SIM_ROOT, "deploy.sh")], {
+		if (!DEPLOY_SCRIPT) return resolve({ code: -1, out: "no deploy script found (deploy.sh / simulate.sh) — deploy first" });
+		// --no-smoke: a UI-triggered recreate only needs the container replaced
+		// with the new mount — the deploy script's model smoke test would keep
+		// the request (and the UI button) hanging for minutes
+		const p = spawn("bash", [DEPLOY_SCRIPT, "--no-smoke"], {
 			env: { ...process.env, OMP_API_TOKEN: containerToken(), IMPORT_HOST_OMP_CONFIG: "0" },
 		});
 		let out = "";
@@ -334,6 +365,17 @@ async function handleWorkspaceAction(res, name, action, body) {
   if (action === "push") {
     if (!isGitRepo(hostDir) && !body?.remote)
       return sendErr(res, 400, "no_remote", "workspace is not a git repo — provide remote (GitHub repo URL) to publish it");
+    if (body?.remote) {
+      // same protocol allowlist as seed: rejects helper URLs like ext::sh -c …
+      let remoteUrl;
+      try {
+        remoteUrl = new URL(body.remote);
+      } catch {
+        return sendErr(res, 400, "bad_url", "invalid git URL");
+      }
+      if (!["https:", "http:", "ssh:", "file:", "git:"].includes(remoteUrl.protocol))
+        return sendErr(res, 400, "bad_url", `unsupported protocol: ${remoteUrl.protocol}`);
+    }
     if (!isGitRepo(hostDir)) {
       const init = await git(["init", "-b", "main"]);
       if (init.code !== 0) return sendErr(res, 500, "init_failed", "git init failed", { stderr: init.err.slice(-800) });
@@ -348,13 +390,11 @@ async function handleWorkspaceAction(res, name, action, body) {
   }
 
   if (action === "export") {
-    let dest;
-    try {
-      dest = path.resolve(body?.dest ?? "");
-      if (!dest) throw new Error();
-    } catch {
+    // validate the raw input: path.resolve("") is the server CWD, which must
+    // never become an implicit export target
+    if (typeof body?.dest !== "string" || !body.dest.trim())
       return sendErr(res, 400, "bad_path", "dest (host directory) required");
-    }
+    const dest = path.resolve(body.dest);
     const simResolved = path.resolve(SIM_ROOT);
     if (dest === simResolved || dest.startsWith(simResolved + path.sep))
       return sendErr(res, 400, "forbidden_path", "refusing to export inside sim/");
@@ -406,7 +446,7 @@ async function handleWorkspaceAction(res, name, action, body) {
 // ---------------------------------------------------------------------------
 async function proxyJson(res, targetPath, { method = "GET", body } = {}) {
   const token = containerToken();
-  if (!token) return sendErr(res, 503, "not_deployed", "container token missing — run: bash sim/simulate.sh");
+  if (!token) return sendErr(res, 503, "not_deployed", "container token missing — deploy first (deploy.sh or simulate.sh)");
   let upstream;
   try {
     upstream = await fetch(CONTAINER_BASE + targetPath, {
@@ -425,7 +465,7 @@ async function proxyJson(res, targetPath, { method = "GET", body } = {}) {
 
 async function proxySSE(req, res, targetPath, body) {
   const token = containerToken();
-  if (!token) return sendErr(res, 503, "not_deployed", "container token missing — run: bash sim/simulate.sh");
+  if (!token) return sendErr(res, 503, "not_deployed", "container token missing — deploy first (deploy.sh or simulate.sh)");
   const abort = new AbortController();
   req.on("close", () => abort.abort());
   let upstream;
@@ -532,17 +572,18 @@ const server = http.createServer(async (req, res) => {
       return await proxyJson(res, "/v1/sessions", { method: "POST", body });
     }
 
-    if ((m = p.match(/^\/api\/sessions\/([^/]+)(\/prompt|\/steer|\/abort)?$/))) {
+    if ((m = p.match(/^\/api\/sessions\/([^/]+)(\/prompt|\/steer|\/abort|\/ui-response|\/history)?$/))) {
       const id = encodeURIComponent(m[1]);
       const action = m[2] ?? "";
       if (!action && req.method === "GET") return await proxyJson(res, `/v1/sessions/${id}`);
+      if (action === "/history" && req.method === "GET") return await proxyJson(res, `/v1/sessions/${id}/history`);
       if (action === "/prompt" && req.method === "POST") {
         const body = await readBody(req).catch(() => ({}));
         if (!body?.text?.trim()) return sendErr(res, 400, "bad_request", "text required");
         return await proxySSE(req, res, `/v1/sessions/${id}/prompt`, { text: body.text });
       }
-      if ((action === "/steer" || action === "/abort") && req.method === "POST") {
-        const body = action === "/steer" ? await readBody(req).catch(() => ({})) : undefined;
+      if ((action === "/steer" || action === "/abort" || action === "/ui-response") && req.method === "POST") {
+        const body = action === "/abort" ? undefined : await readBody(req).catch(() => ({}));
         return await proxyJson(res, `/v1/sessions/${id}${action}`, { method: "POST", body });
       }
       if (!action && req.method === "DELETE") return await proxyJson(res, `/v1/sessions/${id}`, { method: "DELETE" });
@@ -568,7 +609,7 @@ server.on("error", (e) => {
 server.listen(PORT, HOST, () => {
   console.log(`omp UI:    http://${HOST}:${PORT}`);
   fs.writeFileSync(PID_FILE, String(process.pid));
-  console.log(`UI token:  ${UI_TOKEN}   (also in ${UI_TOKEN_FILE}; override with OMP_UI_TOKEN)`);
+  console.log(`UI token:  (stored in ${UI_TOKEN_FILE}; override with OMP_UI_TOKEN)`);
   console.log(`container: ${CONTAINER_BASE} (token from ${CONTAINER_TOKEN_FILE})`);
 });
 

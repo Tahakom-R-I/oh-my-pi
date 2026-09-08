@@ -4,8 +4,9 @@
 const $ = (sel) => document.querySelector(sel);
 const LS_ACTIVE = "omp-ui-active-session";
 const LS_SESSIONS = "omp-ui-sessions";
+const LS_WORKSPACE = "omp-ui-workspace";
 
-const state = { sessionId: null, cwd: null, workspace: null, busy: false };
+const state = { sessionId: null, cwd: null, workspace: null, sessionFile: null, busy: false };
 
 // ---------------------------------------------------------------- helpers
 function toast(msg, isErr = false) {
@@ -63,14 +64,20 @@ function showLogin() {
   $("#app").classList.add("hidden");
 }
 
+let healthTimer = null;
 async function boot() {
   $("#login").classList.add("hidden");
   $("#topbar").classList.remove("hidden");
   $("#app").classList.remove("hidden");
+  // restore the selected workspace before the panels render, so the
+  // workspaces highlight and the filtered session list survive a refresh
+  state.workspace = localStorage.getItem(LS_WORKSPACE) ?? null;
   await refreshHealth();
   await refreshWorkspaces();
   restoreSession();
-  setInterval(refreshHealth, 15000);
+  // re-login calls boot() again — never stack a second poller
+  clearInterval(healthTimer);
+  healthTimer = setInterval(refreshHealth, 15000);
 }
 
 $("#login-form").addEventListener("submit", async (e) => {
@@ -124,8 +131,7 @@ async function refreshWorkspaces() {
     for (const w of data.workspaces) {
       const row = el("div", "ws-item" + (state.workspace === w.name ? " active" : ""));
       const name = el("span", "name", w.name);
-      name.title = w.remote ?? "no git remote (snapshot)";
-      name.addEventListener("click", () => { state.workspace = w.name; refreshWorkspaces(); });
+		name.addEventListener("click", () => selectWorkspace(w.name));
       const tag = el("span", "tag", w.git ? "git" : "dir");
       row.append(name, tag);
       if (w.git) {
@@ -222,30 +228,43 @@ $("#seed-form").addEventListener("submit", async (e) => {
   const btn = $("#seed-form").querySelector("button[type=submit]");
   btn.disabled = true;
   try {
-    if (seedTab === "local") {
-      const p = $("#seed-path").value.trim();
-      if (!p) { toast("enter a host directory path", true); return; }
-      // live mount: recreate the container with the directory attached,
-      // then start a session working directly in the original location
-      const { resp, data } = await jfetch("/api/mount", { method: "POST", body: { path: p } }, 300000);
-      if (!resp.ok) { toast(data?.error?.message ?? `HTTP ${resp.status}`, true); return; }
-      toast(`live-mounted ${data.hostPath}`);
-      state.workspace = data.hostPath.split("/").filter(Boolean).pop();
-      $("#seed-path").value = "";
-      await refreshWorkspaces();
-      await startSession(state.workspace, data.containerPath);
-      return;
-    }
-    // git tab
-    const name = $("#seed-name").value.trim();
-    if (!name) return;
-    const body = { type: "git", name, url: $("#seed-url").value.trim() };
-    const { resp, data } = await jfetch("/api/seed", { method: "POST", body }, 600000);
-    if (!resp.ok) { toast(data?.error?.message ?? `HTTP ${resp.status}`, true); return; }
-    toast(`workspace '${name}' seeded`);
-    $("#seed-name").value = "";
-    state.workspace = name;
-    await refreshWorkspaces();
+		if (seedTab === "local") {
+			const p = $("#seed-path").value.trim();
+			if (!p) { toast("enter a host directory path", true); return; }
+			// live mount: recreate the container with the directory attached,
+			// then start a session working directly in the original location.
+			// The recreate replaces the container — give it visible progress,
+			// the button would otherwise look frozen for the duration.
+			$("#seed-note").textContent = "recreating the container to attach the mount — this can take up to a minute…";
+			try {
+				const { resp, data } = await jfetch("/api/mount", { method: "POST", body: { path: p } }, 300000);
+				if (!resp.ok) { toast(data?.error?.message ?? `HTTP ${resp.status}`, true); return; }
+				toast(`live-mounted ${data.hostPath}`);
+				state.workspace = data.hostPath.split("/").filter(Boolean).pop();
+				$("#seed-path").value = "";
+				await refreshWorkspaces();
+				await startSession(state.workspace, data.containerPath);
+			} finally {
+				setSeedTab("local"); // restores the note text
+			}
+			return;
+		}
+		// git tab
+		const name = $("#seed-name").value.trim();
+		if (!name) { toast("enter a workspace name", true); return; }
+		$("#seed-note").textContent = `cloning ${$("#seed-url").value.trim() || "repository"}…`;
+		try {
+			const body = { type: "git", name, url: $("#seed-url").value.trim() };
+			const { resp, data } = await jfetch("/api/seed", { method: "POST", body }, 600000);
+			if (!resp.ok) { toast(data?.error?.message ?? `HTTP ${resp.status}`, true); return; }
+			toast(`workspace '${name}' seeded`);
+			$("#seed-name").value = "";
+			state.workspace = name;
+			localStorage.setItem(LS_WORKSPACE, name);
+			await refreshWorkspaces();
+		} finally {
+			setSeedTab("git"); // restores the note text
+		}
   } catch (err) {
     toast(`seed failed: ${err.message}`, true);
   } finally {
@@ -265,11 +284,21 @@ function renderSessionChip() {
   chip.classList.remove("hidden");
   chip.textContent = `${state.workspace ?? "session"} · ${state.sessionId.slice(0, 8)}${state.cwd ? " · " + state.cwd : ""}`;
 }
+function selectWorkspace(name) {
+  state.workspace = name;
+  localStorage.setItem(LS_WORKSPACE, name);
+  refreshWorkspaces();
+  renderSessionList(); // sessions are scoped to the selected workspace
+}
 
 function renderSessionList() {
   const box = $("#sessions");
-  const list = sessionsList();
-  if (!list.length) { box.replaceChildren(el("p", "muted", "no sessions yet")); return; }
+  const all = sessionsList();
+  const list = state.workspace ? all.filter((s) => s.workspace === state.workspace) : all;
+  if (!list.length) {
+    box.replaceChildren(el("p", "muted", state.workspace ? `no sessions in '${state.workspace}' yet` : "no sessions yet"));
+    return;
+  }
   box.replaceChildren();
   for (const s of list.slice(0, 12)) {
     const row = el("div", "sess-item" + (s.sessionId === state.sessionId ? " active" : ""));
@@ -289,20 +318,23 @@ function renderSessionList() {
 
 function rememberActive() {
   if (!state.sessionId) return;
-  localStorage.setItem(LS_ACTIVE, JSON.stringify({ sessionId: state.sessionId, cwd: state.cwd, workspace: state.workspace }));
+  localStorage.setItem(LS_ACTIVE, JSON.stringify({ sessionId: state.sessionId, cwd: state.cwd, workspace: state.workspace, sessionFile: state.sessionFile }));
   const list = sessionsList().filter((s) => s.sessionId !== state.sessionId);
-  list.unshift({ sessionId: state.sessionId, cwd: state.cwd, workspace: state.workspace, ts: Date.now() });
+  list.unshift({ sessionId: state.sessionId, cwd: state.cwd, workspace: state.workspace, sessionFile: state.sessionFile, ts: Date.now() });
   saveSessions(list);
 }
 
 function activateSession(s) {
   state.sessionId = s.sessionId;
   state.cwd = s.cwd ?? null;
-  state.workspace = s.workspace ?? null;
+  state.workspace = s.workspace ?? state.workspace;
+  state.sessionFile = s.sessionFile ?? null;
+  if (s.workspace) localStorage.setItem(LS_WORKSPACE, s.workspace);
   rememberActive();
   renderSessionChip();
-  renderSessionList();
-  clearStream(`resumed session ${s.sessionId.slice(0, 8)} — history is on the server; send a prompt to continue.`);
+  selectWorkspace(state.workspace); // re-filters the session list + refreshes the workspace highlight
+  clearStream(`session ${s.sessionId.slice(0, 8)} — loading history…`);
+  renderHistory();
 }
 
 function restoreSession() {
@@ -323,7 +355,9 @@ async function startSession(workspace, cwdOverride) {
     state.sessionId = data.sessionId;
     state.cwd = data.cwd;
     state.workspace = workspace;
-    rememberActive();
+    state.sessionFile = data.sessionFile ?? null;
+    rememberActive(); // persist — without this the session vanishes on refresh
+    localStorage.setItem(LS_WORKSPACE, workspace);
     renderSessionChip();
     renderSessionList();
     clearStream(`session ${data.sessionId.slice(0, 8)} started in ${data.cwd}`);
@@ -371,6 +405,112 @@ function renderTodoPanel(parent, todos) {
   parent.append(d);
   autoScroll();
 }
+// ---------------------------------------------------------- history replay
+// On refresh/activate, pull the persisted transcript and repaint the stream.
+async function renderHistory(clear = true) {
+  const sid = state.sessionId;
+  if (!sid) return;
+  try {
+    const { resp, data } = await jfetch(`/api/sessions/${encodeURIComponent(sid)}/history`, {}, 20000);
+    if (!resp.ok) {
+      if (clear) clearStream("history unavailable — send a prompt to continue (the console reconnects automatically).");
+      return;
+    }
+    if (clear) clearStream("");
+    const entries = data.entries ?? [];
+    if (!entries.length && clear) {
+      stream.append(el("p", "muted", "no history yet — send a prompt."));
+      return;
+    }
+    for (const e of entries) {
+      if (e.role === "user") {
+        appendUser(e.text ?? "");
+      } else if (e.role === "assistant") {
+        if (e.text) {
+          stream.append(el("div", "answer", e.text));
+          stream.append(document.createElement("br"));
+        }
+        for (const t of e.tools ?? []) {
+          const card = el("div", "tool");
+          const head = el("div", "head");
+          head.append(el("span", null, "● " + (t.name ?? "?")));
+          if (t.intent) head.append(el("span", "arg", "  " + clip(String(t.intent), 120)));
+          card.append(head);
+          stream.append(card);
+        }
+      }
+      // e.role === "tool" results are noise for replay — the ask answers and
+      // tool outcomes surface through the model's replies
+    }
+    autoScroll();
+  } catch (e) {
+    if (clear) clearStream(`history unavailable (${e.message}) — send a prompt to continue.`);
+  }
+}
+
+// ---------------------------------------------------------- interactive asks
+// Host tool asked the user something (select/editor): render clickable
+// options and POST the answer to /ui-response. A multi-select loop re-issues
+// ui_request frames with fresh checkedIndices — the new card replaces the old.
+let activeAskCard = null;
+
+function dismissActiveAsk() {
+  if (activeAskCard) { activeAskCard.remove(); activeAskCard = null; }
+}
+
+function answerUi(reqId, value) {
+  const answered = value;
+  dismissActiveAsk();
+  jfetch(`/api/sessions/${encodeURIComponent(state.sessionId)}/ui-response`, {
+    method: "POST",
+    body: { reqId, value },
+  }).then(({ resp }) => {
+    if (!resp.ok) toast("answer rejected — the dialog already expired", true);
+    stream.append(el("div", "sys", answered == null ? "→ cancelled" : `→ ${answered}`));
+    autoScroll();
+  });
+}
+
+function renderUiAsk(ev) {
+  dismissActiveAsk();
+  const card = el("div", "ui-ask");
+  card.append(el("div", "ui-ask-title", ev.title ?? ""));
+  if (ev.kind === "select") {
+    const checked = ev.checkedIndices ?? [];
+    (ev.options ?? []).forEach((opt, i) => {
+      const label = typeof opt === "string" ? opt : opt.label;
+      const desc = typeof opt === "string" ? "" : opt.description;
+      const markable = ev.markableCount === undefined || i < ev.markableCount;
+      let marker = "";
+      if (markable) {
+        if (ev.selectionMarker === "checkbox") marker = checked.includes(i) ? "☑ " : "☐ ";
+        else marker = i === (ev.initialIndex ?? 0) ? "◉ " : "○ ";
+      }
+      const btn = el("button", "ui-ask-option");
+      btn.append(el("span", "marker", marker));
+      const copy = el("span", null, label);
+      if (desc) copy.append(el("span", "desc", ` — ${desc}`));
+      btn.append(copy);
+      btn.addEventListener("click", () => answerUi(ev.reqId, label));
+      card.append(btn);
+    });
+  } else if (ev.kind === "editor") {
+    const ta = document.createElement("textarea");
+    ta.value = ev.prefill ?? "";
+    ta.rows = 3;
+    card.append(ta);
+    const submit = el("button", "ui-ask-option", "Submit");
+    submit.addEventListener("click", () => answerUi(ev.reqId, ta.value));
+    card.append(submit);
+  }
+  const cancel = el("button", "ui-ask-cancel", "Cancel");
+  cancel.addEventListener("click", () => answerUi(ev.reqId, null));
+  card.append(cancel);
+  activeAskCard = card;
+  stream.append(card);
+  autoScroll();
+}
+
 
 function handleFrame(frame, parts) {
   let evName = "message";
@@ -381,8 +521,8 @@ function handleFrame(frame, parts) {
   }
   let ev;
   try { ev = JSON.parse(dataLines.join("\n")); } catch { return; }
-  if (evName === "error") { appendError(`omp error: ${extractText(ev)}`); parts.failed = true; return; }
-  if (evName === "done") { parts.done = true; return; }
+  if (evName === "error") { appendError(`omp error: ${extractText(ev)}`); parts.failed = true; dismissActiveAsk(); return; }
+  if (evName === "done") { parts.done = true; dismissActiveAsk(); return; }
   if (typeof ev !== "object") return;
 
   const etype = ev.type ?? "";
@@ -443,6 +583,13 @@ function handleFrame(frame, parts) {
     else if (t.printed) t.card.append(el("div", "ok", "✓ done"));
     delete parts.tools[ev.toolCallId];
     autoScroll();
+  } else if (etype === "ui_notice") {
+    br(parts);
+    const icons = { info: "ℹ", warning: "⚠", error: "✗" };
+    stream.append(el("div", "sys" + (ev.level === "error" ? " err" : ev.level === "warning" ? " warn" : ""), `${icons[ev.level] ?? "ℹ"} ${ev.message ?? ""}`));
+    autoScroll();
+  } else if (etype === "ui_request") {
+    renderUiAsk(ev);
   } else if (etype === "todo_reminder") {
     br(parts);
     renderTodoPanel(stream, ev.todos ?? []);
@@ -476,13 +623,17 @@ function setBusy(busy) {
   $("#abort").classList.toggle("hidden", !busy);
   $("#steer-row").classList.toggle("hidden", !busy);
 }
-
 function promptFetch(sessionId, text) {
+  // timeout covers header arrival only — the SSE body streams for as long
+  // as the turn runs (heartbeats keep it alive; Abort exists for the user)
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(new DOMException("timeout", "TimeoutError")), 60000);
   return fetch(`/api/sessions/${encodeURIComponent(sessionId)}/prompt`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ text }),
-  });
+    signal: ctrl.signal,
+  }).finally(() => clearTimeout(timer));
 }
 
 async function recoverSession() {
@@ -540,6 +691,7 @@ async function sendPrompt() {
         return;
       }
       stream.append(el("div", "sys", `server session was gone — resumed as ${state.sessionId.slice(0, 8)} (${state.cwd ?? "default workspace"})`));
+      await renderHistory(false); // repaint prior turns below the recovery notice
       resp = await promptFetch(state.sessionId, text);
       if (resp.status === 404) {
         toast("could not recover the session — start a new one from the sidebar", true);
@@ -565,7 +717,11 @@ async function sendPrompt() {
         const frame = buf.slice(0, idx);
         buf = buf.slice(idx + 2);
         if (frame.trim()) handleFrame(frame, parts);
-        if (parts.done || parts.failed) break;
+        if (parts.done || parts.failed) {
+          // stop reading early — release the connection instead of holding it
+          reader.cancel().catch(() => {});
+          break;
+        }
       }
       if (parts.done || parts.failed) break;
     }

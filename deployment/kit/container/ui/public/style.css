@@ -146,3 +146,48 @@ button:disabled { opacity: 0.45; cursor: not-allowed; }
   border-radius: 6px; padding: 0.5rem 0.8rem; max-width: 26rem;
 }
 .toast.err { border-left-color: var(--red); color: var(--red); }
+/* interactive asks (host select/editor dialogs) */
+.ui-ask {
+  border: 1px solid var(--accent);
+  border-radius: 8px;
+  padding: 0.6rem;
+  margin: 0.4rem 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  background: var(--panel);
+}
+.ui-ask-title { color: var(--accent); font-weight: 600; white-space: pre-wrap; }
+.ui-ask-option {
+  text-align: left;
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 5px;
+  padding: 0.35rem 0.6rem;
+  cursor: pointer;
+  font: inherit;
+}
+.ui-ask-option:hover { border-color: var(--accent); }
+.ui-ask-option .marker { color: var(--accent); margin-right: 0.4rem; }
+.ui-ask-option .desc { color: var(--muted); }
+.ui-ask textarea {
+  width: 100%;
+  background: transparent;
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 0.4rem;
+  font: inherit;
+  resize: vertical;
+}
+.ui-ask-cancel {
+  align-self: flex-end;
+  background: transparent;
+  border: none;
+  color: var(--muted);
+  cursor: pointer;
+  padding: 0.2rem 0.4rem;
+  font: inherit;
+}
+.ui-ask-cancel:hover { color: var(--red); }
