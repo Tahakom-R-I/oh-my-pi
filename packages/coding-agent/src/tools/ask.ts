@@ -156,7 +156,11 @@ const RECOMMENDED_SUFFIX = " (Recommended)";
 const TIMEOUT_DETECTION_TOLERANCE_MS = 1_000;
 
 function getDoneOptionLabel(): string {
-	return `${theme.status.success} Done selecting`;
+	// `theme` is a `var` that only the TUI initializes — headless promptable
+	// surfaces (SDK `interactivePrompts`, ACP, RPC) have no theme instance and
+	// must degrade to plain text. The label is matched verbatim on answers, so
+	// both forms round-trip within a session.
+	return theme?.status.success ? `${theme.status.success} Done selecting` : "Done selecting";
 }
 
 /** Add "(Recommended)" suffix to the option at the given index if not already present */
@@ -329,6 +333,15 @@ function buildCustomInputRows(
 		});
 	};
 
+	// Same headless fallback as getDoneOptionLabel: ASCII glyphs when the TUI
+	// theme was never initialized. These rows only ever render as dialog text.
+	const glyphs = {
+		radioSelected: theme?.radio.selected ?? "●",
+		radioUnselected: theme?.radio.unselected ?? "○",
+		checkboxChecked: theme?.checkbox.checked ?? "☑",
+		checkboxUnchecked: theme?.checkbox.unchecked ?? "☐",
+		cursor: theme?.nav.cursor ?? "❯",
+	};
 	for (const index of window.indices) {
 		const gap = window.gapBefore.get(index);
 		if (gap !== undefined) emitGap(gap);
@@ -338,11 +351,11 @@ function buildCustomInputRows(
 		const isMarkable = index < context.markableCount;
 		const prefix =
 			context.selectionMarker === "radio" && (isMarkable || isSelected)
-				? `${isSelected ? theme.radio.selected : theme.radio.unselected} `
+				? `${isSelected ? glyphs.radioSelected : glyphs.radioUnselected} `
 				: context.selectionMarker === "checkbox" && isMarkable
-					? `${checked.has(index) ? theme.checkbox.checked : theme.checkbox.unchecked} `
+					? `${checked.has(index) ? glyphs.checkboxChecked : glyphs.checkboxUnchecked} `
 					: isSelected
-						? `${theme.nav.cursor} `
+						? `${glyphs.cursor} `
 						: "  ";
 		rows.push({ text: clampLineToWidth(prefix + label, contentWidth), priority: -1 });
 		const description = getSelectOptionDescription(option);
