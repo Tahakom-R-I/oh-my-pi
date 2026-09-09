@@ -408,15 +408,29 @@ function renderTodoPanel(parent, todos) {
 // ---------------------------------------------------------- history replay
 // On refresh/activate, pull the persisted transcript and repaint the stream.
 async function renderHistory(clear = true) {
-  const sid = state.sessionId;
-  if (!sid) return;
+  if (!state.sessionId) return;
   try {
-    const { resp, data } = await jfetch(`/api/sessions/${encodeURIComponent(sid)}/history`, {}, 20000);
+    let resumed = false;
+    let { resp, data } = await jfetch(`/api/sessions/${encodeURIComponent(state.sessionId)}/history`, {}, 20000);
+    if (resp.status === 404) {
+      // the container lost the runtime session (restart/eviction) — resume it
+      // from the persisted transcript instead of punting to the next prompt
+      const rec = await recoverSession();
+      if (!rec) {
+        if (clear) clearStream("history unavailable — session could not be resumed.");
+        return;
+      }
+      resumed = true;
+      ({ resp, data } = await jfetch(`/api/sessions/${encodeURIComponent(state.sessionId)}/history`, {}, 20000));
+    }
     if (!resp.ok) {
       if (clear) clearStream("history unavailable — send a prompt to continue (the console reconnects automatically).");
       return;
     }
     if (clear) clearStream("");
+    if (resumed) {
+      stream.append(el("div", "sys", `server session was gone — resumed as ${state.sessionId.slice(0, 8)} (${state.cwd ?? "default workspace"})`));
+    }
     const entries = data.entries ?? [];
     if (!entries.length && clear) {
       stream.append(el("p", "muted", "no history yet — send a prompt."));
