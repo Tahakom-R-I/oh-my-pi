@@ -1,0 +1,4 @@
+# runtime state: credential vault, tokens, transcripts, user workspaces
+run/
+# UI auth token
+ui/.ui-token

@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>omp — remote console</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+
+<div id="login" class="overlay">
+  <form id="login-form" class="card">
+    <h1>⌘ omp console</h1>
+    <p class="muted">Enter the UI token printed by<br><code>node sim/ui/server.mjs</code></p>
+    <input id="login-token" type="password" placeholder="UI token" autocomplete="current-password" autofocus>
+    <button type="submit" class="primary">Sign in</button>
+    <p id="login-error" class="error hidden"></p>
+  </form>
+</div>
+
+<header id="topbar" class="hidden">
+  <span class="brand">⌘ omp console</span>
+  <span id="status-dot" class="dot off"></span>
+  <span id="status-label" class="muted">checking container…</span>
+  <span class="spacer"></span>
+  <span id="session-chip" class="chip hidden"></span>
+  <button id="logout" class="ghost">logout</button>
+</header>
+
+<main id="app" class="hidden">
+  <aside id="sidebar">
+    <section class="panel">
+      <h2>Workspaces</h2>
+      <div id="workspaces"><p class="muted">loading…</p></div>
+      <details id="seed-box">
+        <summary>＋ Seed a new workspace</summary>
+        <div class="tabs">
+          <button id="tab-git" class="tab active" type="button">Git URL</button>
+          <button id="tab-local" class="tab" type="button">Local directory</button>
+        </div>
+        <form id="seed-form" novalidate>
+          <input id="seed-url" placeholder="https://github.com/user/repo.git">
+          <input id="seed-path" placeholder="/home/you/projects/myapp" class="hidden">
+          <input id="seed-name" placeholder="workspace name">
+          <button type="submit" class="primary">Seed into container</button>
+          <p id="seed-note" class="muted small">Clones the repo into the container's shared workspaces volume.</p>
+        </form>
+      </details>
+    </section>
+
+    <section class="panel">
+      <h2>Sessions</h2>
+      <div id="sessions"><p class="muted">no sessions yet</p></div>
+      <button id="new-session" class="ghost" type="button">＋ new session in selected workspace</button>
+    </section>
+  </aside>
+
+  <section id="main">
+    <div id="stream"><p class="muted">Select or start a session, then send a prompt. Everything the agent does streams here.</p></div>
+    <form id="composer">
+      <input id="prompt" placeholder="Prompt the agent…" autocomplete="off">
+      <button id="send" class="primary" type="submit">Send</button>
+      <button id="abort" type="button" class="danger hidden">Abort</button>
+    </form>
+    <form id="steer-row" class="hidden">
+      <span class="muted">running —</span>
+      <input id="steer-input" placeholder="steer the agent…" autocomplete="off">
+      <button type="submit">Steer</button>
+    </form>
+  </section>
+</main>
+
+<div id="toasts"></div>
+<script src="/app.js"></script>
+</body>
+</html>
